@@ -125,6 +125,20 @@ func main() {
 	mux.HandleFunc("POST /api/chat", server.requireAuth(server.handleChat))
 	mux.HandleFunc("GET /api/chat/history", server.requireAuth(server.handleChatHistory))
 
+	// CORS handler to allow any frontend (localhost or production domain) to connect
+	corsHandler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Access-Control-Allow-Origin", "*")
+		w.Header().Set("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
+		w.Header().Set("Access-Control-Allow-Headers", "Content-Type, Authorization")
+
+		if r.Method == http.MethodOptions {
+			w.WriteHeader(http.StatusNoContent)
+			return
+		}
+
+		mux.ServeHTTP(w, r)
+	})
+
 	if cfg.Domain != "" {
 		if err := os.MkdirAll(cfg.CertDir, 0700); err != nil {
 			log.Fatalf("Failed to create cert directory: %v", err)
@@ -138,7 +152,7 @@ func main() {
 
 		httpsServer := &http.Server{
 			Addr:      ":443",
-			Handler:   mux,
+			Handler:   corsHandler,
 			TLSConfig: certManager.TLSConfig(),
 		}
 
@@ -156,7 +170,7 @@ func main() {
 		}
 	} else {
 		fmt.Printf("Inference Backend listening on http://localhost:%s\n", cfg.Port)
-		if err := http.ListenAndServe(":"+cfg.Port, mux); err != nil {
+		if err := http.ListenAndServe(":"+cfg.Port, corsHandler); err != nil {
 			log.Fatalf("Server stopped: %v", err)
 		}
 	}
