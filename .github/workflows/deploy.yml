@@ -72,7 +72,7 @@ jobs:
           port: ${{ secrets.SSH_PORT || 22 }}
           script: |
             mkdir -p /home/ubuntu/inference
-            cp /tmp/server-bin /home/ubuntu/inference/server-bin
+            cp --remove-destination /tmp/server-bin /home/ubuntu/inference/server-bin
             chmod +x /home/ubuntu/inference/server-bin
             rm -f /tmp/server-bin
             sudo systemctl restart inference
