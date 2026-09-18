@@ -1,1 +1,7 @@
 aryan-finetune-backup/
+venv/
+__pycache__/
+test-infer
+server-bin
+*.db
+.env
