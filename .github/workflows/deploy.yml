@@ -20,16 +20,18 @@ jobs:
       - name: Set up Go
         uses: actions/setup-go@v5
         with:
-          go-version-file: 'go.mod'
+          go-version-file: 'backend/go.mod'
           check-latest: true
 
       - name: Install dependencies
+        working-directory: backend
         run: go mod download
 
       - name: Build binary
+        working-directory: backend
         run: |
           # CGO_ENABLED=0 produces a static binary; -s -w removes debug symbols
-          CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -ldflags="-s -w" -v -o server-bin ./server
+          CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -ldflags="-s -w" -v -o ../server-bin .
 
       - name: Upload binary artifact
         if: github.ref == 'refs/heads/main' && github.event_name == 'push'
