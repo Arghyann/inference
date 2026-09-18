@@ -5,3 +5,4 @@ test-infer
 server-bin
 *.db
 .env
+certs/

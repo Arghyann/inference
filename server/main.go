@@ -14,12 +14,15 @@ import (
 
 	"github.com/joho/godotenv"
 	modal "github.com/modal-labs/modal-client/go"
+	"golang.org/x/crypto/acme/autocert"
 )
 
 type Config struct {
 	Port      string
 	JWTSecret string
 	DBPath    string
+	Domain    string
+	CertDir   string
 }
 
 type AppServer struct {
@@ -43,6 +46,8 @@ func main() {
 		Port:      getEnv("PORT", "8080"),
 		JWTSecret: getEnv("JWT_SECRET", "super-secret-default-key-change-in-production"),
 		DBPath:    getEnv("DB_PATH", "./inference.db"),
+		Domain:    getEnv("DOMAIN", ""),
+		CertDir:   getEnv("CERT_DIR", "./certs"),
 	}
 
 	// 2. Initialize Database
@@ -120,9 +125,40 @@ func main() {
 	mux.HandleFunc("POST /api/chat", server.requireAuth(server.handleChat))
 	mux.HandleFunc("GET /api/chat/history", server.requireAuth(server.handleChatHistory))
 
-	fmt.Printf("Inference Backend listening on http://localhost:%s\n", cfg.Port)
-	if err := http.ListenAndServe(":"+cfg.Port, mux); err != nil {
-		log.Fatalf("Server stopped: %v", err)
+	if cfg.Domain != "" {
+		if err := os.MkdirAll(cfg.CertDir, 0700); err != nil {
+			log.Fatalf("Failed to create cert directory: %v", err)
+		}
+
+		certManager := &autocert.Manager{
+			Prompt:     autocert.AcceptTOS,
+			HostPolicy: autocert.HostWhitelist(cfg.Domain),
+			Cache:      autocert.DirCache(cfg.CertDir),
+		}
+
+		httpsServer := &http.Server{
+			Addr:      ":443",
+			Handler:   mux,
+			TLSConfig: certManager.TLSConfig(),
+		}
+
+		// Handle Let's Encrypt HTTP-01 challenge and redirect HTTP to HTTPS
+		go func() {
+			fmt.Println("HTTP server listening on :80 (ACME challenges & HTTPS redirect)")
+			if err := http.ListenAndServe(":80", certManager.HTTPHandler(nil)); err != nil {
+				log.Printf("HTTP challenge server stopped: %v", err)
+			}
+		}()
+
+		fmt.Printf("Inference Backend listening with automatic SSL on https://%s (port 443)\n", cfg.Domain)
+		if err := httpsServer.ListenAndServeTLS("", ""); err != nil {
+			log.Fatalf("HTTPS Server stopped: %v", err)
+		}
+	} else {
+		fmt.Printf("Inference Backend listening on http://localhost:%s\n", cfg.Port)
+		if err := http.ListenAndServe(":"+cfg.Port, mux); err != nil {
+			log.Fatalf("Server stopped: %v", err)
+		}
 	}
 }
 
