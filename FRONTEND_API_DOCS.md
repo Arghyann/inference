@@ -57,9 +57,18 @@ export interface AuthResponse {
   username: string;
 }
 
-// Chat
+// Chat & Conversations
+export interface Conversation {
+  id: string;
+  user_id: number;
+  title: string;
+  created_at: string;
+  updated_at: string;
+}
+
 export interface ChatMessage {
   id?: number;
+  conversation_id?: string;
   user_id?: number;
   role: 'user' | 'assistant';
   content: string;
@@ -67,12 +76,14 @@ export interface ChatMessage {
 }
 
 export interface SendMessagePayload {
-  message: string; // The user's input prompt
+  message: string;             // The user's input prompt
+  conversation_id?: string;    // Optional: ID of conversation thread. If omitted, starts a new conversation.
 }
 
 export interface SendMessageResponse {
-  reply: string;      // The model's response
-  created_at: string; // ISO timestamp
+  reply: string;               // The model's response
+  created_at: string;          // ISO timestamp
+  conversation_id: string;     // Active conversation thread ID
 }
 
 export interface HistoryResponse {
@@ -230,6 +241,93 @@ Pings Modal to pre-warm the container and load model weights without running gen
     }
     ```
   - `502 Bad Gateway`: `{"error": "Failed to warm up GPU container. Please try again."}`
+
+---
+
+### 4.7 List User Conversations
+Returns all conversation sessions for the user, ordered by most recently updated.
+- **URL:** `GET /api/conversations`
+- **Auth:** Required (`Authorization: Bearer <TOKEN>`)
+- **Responses:**
+  - `200 OK`:
+    ```json
+    {
+      "conversations": [
+        {
+          "id": "conv_a1b2c3d4e5f6",
+          "user_id": 4,
+          "title": "LLaMA fine-tuning questions",
+          "created_at": "2026-09-19T08:00:00Z",
+          "updated_at": "2026-09-19T08:15:00Z"
+        }
+      ]
+    }
+    ```
+
+---
+
+### 4.8 Create New Conversation
+Explicitly initializes a new conversation thread.
+- **URL:** `POST /api/conversations`
+- **Auth:** Required (`Authorization: Bearer <TOKEN>`)
+- **Request Body:**
+  ```json
+  {
+    "title": "New Chat"
+  }
+  ```
+- **Responses:**
+  - `201 Created`:
+    ```json
+    {
+      "id": "conv_a1b2c3d4e5f6",
+      "user_id": 4,
+      "title": "New Chat",
+      "created_at": "2026-09-19T08:00:00Z",
+      "updated_at": "2026-09-19T08:00:00Z"
+    }
+    ```
+
+---
+
+### 4.9 Get Conversation Messages
+Fetches the messages for a specific conversation session.
+- **URL:** `GET /api/conversations/{id}`
+- **Auth:** Required (`Authorization: Bearer <TOKEN>`)
+- **Responses:**
+  - `200 OK`:
+    ```json
+    {
+      "messages": [
+        {
+          "id": 1,
+          "role": "user",
+          "content": "Friend: Hello!",
+          "created_at": "2026-09-19T08:00:00Z"
+        },
+        {
+          "id": 2,
+          "role": "assistant",
+          "content": "Hey! What's up?",
+          "created_at": "2026-09-19T08:00:03Z"
+        }
+      ]
+    }
+    ```
+
+---
+
+### 4.10 Delete Conversation
+Permanently removes a conversation thread and its associated message history.
+- **URL:** `DELETE /api/conversations/{id}`
+- **Auth:** Required (`Authorization: Bearer <TOKEN>`)
+- **Responses:**
+  - `200 OK`:
+    ```json
+    {
+      "message": "Conversation deleted"
+    }
+    ```
 
 ---
 

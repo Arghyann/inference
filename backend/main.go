@@ -135,7 +135,11 @@ func main() {
 	mux.HandleFunc("POST /api/auth/register", RateLimitMiddleware(registerLimiter, server.handleRegister))
 	mux.HandleFunc("POST /api/auth/login", RateLimitMiddleware(loginLimiter, server.handleLogin))
 
-	// Protected Chat routes (Bearer JWT required)
+	// Protected Chat & Conversation routes (Bearer JWT required)
+	mux.HandleFunc("GET /api/conversations", server.requireAuth(server.handleListConversations))
+	mux.HandleFunc("POST /api/conversations", server.requireAuth(server.handleCreateConversation))
+	mux.HandleFunc("GET /api/conversations/{id}", server.requireAuth(server.handleGetConversation))
+	mux.HandleFunc("DELETE /api/conversations/{id}", server.requireAuth(server.handleDeleteConversation))
 	mux.HandleFunc("POST /api/chat", server.requireAuth(server.handleChat))
 	mux.HandleFunc("GET /api/chat/history", server.requireAuth(server.handleChatHistory))
 	mux.HandleFunc("GET /api/chat/status", server.requireAuth(server.handleGpuStatus))
@@ -144,7 +148,7 @@ func main() {
 	// CORS handler to allow any frontend (localhost or production domain) to connect
 	corsHandler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Access-Control-Allow-Origin", "*")
-		w.Header().Set("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
+		w.Header().Set("Access-Control-Allow-Methods", "GET, POST, DELETE, OPTIONS")
 		w.Header().Set("Access-Control-Allow-Headers", "Content-Type, Authorization")
 
 		if r.Method == http.MethodOptions {
@@ -292,12 +296,14 @@ func (s *AppServer) handleLogin(w http.ResponseWriter, r *http.Request) {
 }
 
 type ChatRequest struct {
-	Message string `json:"message"`
+	Message        string `json:"message"`
+	ConversationID string `json:"conversation_id,omitempty"`
 }
 
 type ChatResponse struct {
-	Reply     string    `json:"reply"`
-	CreatedAt time.Time `json:"created_at"`
+	Reply          string    `json:"reply"`
+	CreatedAt      time.Time `json:"created_at"`
+	ConversationID string    `json:"conversation_id"`
 }
 
 func (s *AppServer) handleChat(w http.ResponseWriter, r *http.Request, claims *Claims) {
@@ -313,29 +319,50 @@ func (s *AppServer) handleChat(w http.ResponseWriter, r *http.Request, claims *C
 		return
 	}
 
-	// 1. Fetch user's previous 25 messages from SQLite for rich context
-	history, err := GetUserHistory(s.db, claims.UserID, 25)
-	if err != nil {
-		log.Printf("Error fetching history: %v", err)
-		history = []Message{}
+	conversationID := strings.TrimSpace(req.ConversationID)
+	if conversationID == "" {
+		conv, err := CreateConversation(s.db, "", "New Chat", claims.UserID)
+		if err != nil {
+			log.Printf("Error creating conversation: %v", err)
+			writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "Failed to create conversation"})
+			return
+		}
+		conversationID = conv.ID
+	} else {
+		// Verify conversation exists or create it
+		conv, _ := GetConversationByID(s.db, conversationID, claims.UserID)
+		if conv == nil {
+			conv, err := CreateConversation(s.db, conversationID, "New Chat", claims.UserID)
+			if err != nil {
+				log.Printf("Error initializing conversation: %v", err)
+				writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "Failed to initialize conversation"})
+				return
+			}
+			conversationID = conv.ID
+		}
 	}
 
-	// 2. Append new user prompt (formatted to match Aryan's training data)
-	history = append(history, Message{
-		Role:    "user",
-		Content: fmt.Sprintf("Friend: %s", prompt),
-	})
+	// 1. Fetch conversation's previous 25 messages from SQLite for rich context
+	convMessages, err := GetConversationMessages(s.db, conversationID, claims.UserID, 25)
+	if err != nil {
+		log.Printf("Error fetching conversation messages: %v", err)
+		convMessages = []Message{}
+	}
 
-	// 3. Convert to Modal payload: []any of map[string]any
-	payload := make([]any, len(history))
-	for i, m := range history {
+	// 2. Format history for model prompt
+	payload := make([]any, len(convMessages)+1)
+	for i, m := range convMessages {
 		payload[i] = map[string]any{
 			"role":    m.Role,
 			"content": m.Content,
 		}
 	}
+	payload[len(convMessages)] = map[string]any{
+		"role":    "user",
+		"content": fmt.Sprintf("Friend: %s", prompt),
+	}
 
-	// 4. Call Modal GPU Function (120s timeout to allow for container cold start + token generation)
+	// 3. Call Modal GPU Function (120s timeout to allow for container cold start + token generation)
 	ctx, cancel := context.WithTimeout(r.Context(), 120*time.Second)
 	defer cancel()
 
@@ -356,13 +383,77 @@ func (s *AppServer) handleChat(w http.ResponseWriter, r *http.Request, claims *C
 	s.lastActivity = time.Now()
 	s.lastActivityMu.Unlock()
 
-	// 5. Save user message and AI reply into SQLite
-	_ = SaveMessage(s.db, claims.UserID, "user", fmt.Sprintf("Friend: %s", prompt))
-	_ = SaveMessage(s.db, claims.UserID, "assistant", reply)
+	// 4. Save user message and AI reply into SQLite under this conversation
+	_ = SaveConversationMessage(s.db, conversationID, claims.UserID, "user", fmt.Sprintf("Friend: %s", prompt))
+	_ = SaveConversationMessage(s.db, conversationID, claims.UserID, "assistant", reply)
 
 	writeJSON(w, http.StatusOK, ChatResponse{
-		Reply:     reply,
-		CreatedAt: time.Now().UTC(),
+		Reply:          reply,
+		CreatedAt:      time.Now().UTC(),
+		ConversationID: conversationID,
+	})
+}
+
+func (s *AppServer) handleListConversations(w http.ResponseWriter, r *http.Request, claims *Claims) {
+	convs, err := GetUserConversations(s.db, claims.UserID)
+	if err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "Failed to fetch conversations"})
+		return
+	}
+	if convs == nil {
+		convs = []Conversation{}
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"conversations": convs,
+	})
+}
+
+type CreateConversationRequest struct {
+	Title string `json:"title"`
+}
+
+func (s *AppServer) handleCreateConversation(w http.ResponseWriter, r *http.Request, claims *Claims) {
+	var req CreateConversationRequest
+	_ = json.NewDecoder(r.Body).Decode(&req)
+	conv, err := CreateConversation(s.db, "", req.Title, claims.UserID)
+	if err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "Failed to create conversation"})
+		return
+	}
+	writeJSON(w, http.StatusCreated, conv)
+}
+
+func (s *AppServer) handleGetConversation(w http.ResponseWriter, r *http.Request, claims *Claims) {
+	id := r.PathValue("id")
+	if id == "" {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "Conversation ID required"})
+		return
+	}
+	messages, err := GetConversationMessages(s.db, id, claims.UserID, 50)
+	if err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "Failed to fetch messages"})
+		return
+	}
+	if messages == nil {
+		messages = []Message{}
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"messages": messages,
+	})
+}
+
+func (s *AppServer) handleDeleteConversation(w http.ResponseWriter, r *http.Request, claims *Claims) {
+	id := r.PathValue("id")
+	if id == "" {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "Conversation ID required"})
+		return
+	}
+	if err := DeleteConversation(s.db, id, claims.UserID); err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "Failed to delete conversation"})
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]string{
+		"message": "Conversation deleted",
 	})
 }
 
@@ -421,6 +512,20 @@ func (s *AppServer) handleWarmup(w http.ResponseWriter, r *http.Request, claims 
 }
 
 func (s *AppServer) handleChatHistory(w http.ResponseWriter, r *http.Request, claims *Claims) {
+	conversationID := r.URL.Query().Get("conversation_id")
+	if conversationID != "" {
+		messages, err := GetConversationMessages(s.db, conversationID, claims.UserID, 50)
+		if err != nil {
+			writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "Failed to fetch history"})
+			return
+		}
+		if messages == nil {
+			messages = []Message{}
+		}
+		writeJSON(w, http.StatusOK, map[string]any{"history": messages})
+		return
+	}
+
 	history, err := GetUserHistory(s.db, claims.UserID, 20)
 	if err != nil {
 		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "Failed to fetch history"})

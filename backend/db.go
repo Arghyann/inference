@@ -6,7 +6,9 @@ import (
 	"encoding/hex"
 	"fmt"
 	"strings"
+	"time"
 
+	"github.com/google/uuid"
 	_ "modernc.org/sqlite" // Pure Go SQLite driver (uses <3MB RAM)
 )
 
@@ -18,9 +20,20 @@ type User struct {
 	IsApproved   bool
 }
 
+type Conversation struct {
+	ID        string    `json:"id"`
+	UserID    int64     `json:"user_id"`
+	Title     string    `json:"title"`
+	CreatedAt time.Time `json:"created_at"`
+	UpdatedAt time.Time `json:"updated_at"`
+}
+
 type Message struct {
-	Role    string `json:"role"`    // "user" or "assistant"
-	Content string `json:"content"` // message text
+	ID             int64     `json:"id,omitempty"`
+	ConversationID string    `json:"conversation_id,omitempty"`
+	Role           string    `json:"role"`    // "user" or "assistant"
+	Content        string    `json:"content"` // message text
+	CreatedAt      time.Time `json:"created_at,omitempty"`
 }
 
 // InitDB sets up SQLite with WAL mode and memory caps (<3MB RAM)
@@ -51,13 +64,26 @@ func InitDB(dbPath string) (*sql.DB, error) {
 		created_at DATETIME DEFAULT CURRENT_TIMESTAMP
 	);
 
+	CREATE TABLE IF NOT EXISTS conversations (
+		id TEXT PRIMARY KEY,
+		user_id INTEGER NOT NULL,
+		title TEXT NOT NULL,
+		created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+		updated_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+		FOREIGN KEY(user_id) REFERENCES users(id) ON DELETE CASCADE
+	);
+
+	CREATE INDEX IF NOT EXISTS idx_conversations_user_id ON conversations(user_id, updated_at DESC);
+
 	CREATE TABLE IF NOT EXISTS messages (
 		id INTEGER PRIMARY KEY AUTOINCREMENT,
+		conversation_id TEXT,
 		user_id INTEGER NOT NULL,
 		role TEXT NOT NULL,
 		content TEXT NOT NULL,
 		created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-		FOREIGN KEY(user_id) REFERENCES users(id) ON DELETE CASCADE
+		FOREIGN KEY(user_id) REFERENCES users(id) ON DELETE CASCADE,
+		FOREIGN KEY(conversation_id) REFERENCES conversations(id) ON DELETE CASCADE
 	);
 
 	CREATE INDEX IF NOT EXISTS idx_messages_user_id ON messages(user_id, created_at);
@@ -66,6 +92,10 @@ func InitDB(dbPath string) (*sql.DB, error) {
 	if _, err := db.Exec(pragmas); err != nil {
 		return nil, fmt.Errorf("failed to initialize db schema: %w", err)
 	}
+
+	// Safe migration: Add conversation_id column to messages table if table already existed
+	_, _ = db.Exec("ALTER TABLE messages ADD COLUMN conversation_id TEXT;")
+	_, _ = db.Exec("CREATE INDEX IF NOT EXISTS idx_messages_conv_id ON messages(conversation_id, created_at);")
 
 	return db, nil
 }
@@ -184,4 +214,142 @@ func GetUserHistory(db *sql.DB, userID int64, limit int) ([]Message, error) {
 		history = append(history, m)
 	}
 	return history, nil
+}
+
+// CreateConversation creates a new chat session for the user
+func CreateConversation(db *sql.DB, id, title string, userID int64) (*Conversation, error) {
+	if id == "" {
+		id = "conv_" + strings.ReplaceAll(uuid.New().String(), "-", "")[:16]
+	}
+	title = strings.TrimSpace(title)
+	if title == "" {
+		title = "New Chat"
+	}
+	now := time.Now().UTC()
+	_, err := db.Exec(
+		"INSERT INTO conversations (id, user_id, title, created_at, updated_at) VALUES (?, ?, ?, ?, ?)",
+		id, userID, title, now, now,
+	)
+	if err != nil {
+		return nil, err
+	}
+	return &Conversation{
+		ID:        id,
+		UserID:    userID,
+		Title:     title,
+		CreatedAt: now,
+		UpdatedAt: now,
+	}, nil
+}
+
+// GetUserConversations fetches all conversations for a user, sorted by most recent first
+func GetUserConversations(db *sql.DB, userID int64) ([]Conversation, error) {
+	rows, err := db.Query(
+		"SELECT id, user_id, title, created_at, updated_at FROM conversations WHERE user_id = ? ORDER BY updated_at DESC",
+		userID,
+	)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var convs []Conversation
+	for rows.Next() {
+		var c Conversation
+		if err := rows.Scan(&c.ID, &c.UserID, &c.Title, &c.CreatedAt, &c.UpdatedAt); err != nil {
+			return nil, err
+		}
+		convs = append(convs, c)
+	}
+	return convs, nil
+}
+
+// GetConversationByID fetches a single conversation by ID for the user
+func GetConversationByID(db *sql.DB, id string, userID int64) (*Conversation, error) {
+	var c Conversation
+	err := db.QueryRow(
+		"SELECT id, user_id, title, created_at, updated_at FROM conversations WHERE id = ? AND user_id = ?",
+		id, userID,
+	).Scan(&c.ID, &c.UserID, &c.Title, &c.CreatedAt, &c.UpdatedAt)
+	if err == sql.ErrNoRows {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	return &c, nil
+}
+
+// GetConversationMessages gets the messages for a specific conversation in chronological order
+func GetConversationMessages(db *sql.DB, conversationID string, userID int64, limit int) ([]Message, error) {
+	if limit <= 0 || limit > 100 {
+		limit = 50
+	}
+	query := `
+	SELECT id, role, content, created_at FROM (
+		SELECT id, role, content, created_at 
+		FROM messages 
+		WHERE conversation_id = ? AND user_id = ? 
+		ORDER BY created_at DESC 
+		LIMIT ?
+	) ORDER BY id ASC;
+	`
+	rows, err := db.Query(query, conversationID, userID, limit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var messages []Message
+	for rows.Next() {
+		var m Message
+		m.ConversationID = conversationID
+		if err := rows.Scan(&m.ID, &m.Role, &m.Content, &m.CreatedAt); err != nil {
+			return nil, err
+		}
+		messages = append(messages, m)
+	}
+	return messages, nil
+}
+
+// SaveConversationMessage stores a message in a specific conversation and updates its timestamp
+func SaveConversationMessage(db *sql.DB, conversationID string, userID int64, role, content string) error {
+	now := time.Now().UTC()
+	_, err := db.Exec(
+		"INSERT INTO messages (conversation_id, user_id, role, content, created_at) VALUES (?, ?, ?, ?, ?)",
+		conversationID, userID, role, content, now,
+	)
+	if err != nil {
+		return err
+	}
+
+	// Update conversation updated_at timestamp
+	_, _ = db.Exec("UPDATE conversations SET updated_at = ? WHERE id = ? AND user_id = ?", now, conversationID, userID)
+
+	// Auto-title the conversation from the first user prompt if it still has default title
+	if role == "user" {
+		clean := strings.TrimSpace(strings.TrimPrefix(content, "Friend: "))
+		if clean != "" {
+			runes := []rune(clean)
+			if len(runes) > 30 {
+				clean = string(runes[:30]) + "…"
+			}
+			_, _ = db.Exec(
+				"UPDATE conversations SET title = ? WHERE id = ? AND user_id = ? AND title = 'New Chat'",
+				clean, conversationID, userID,
+			)
+		}
+	}
+
+	return nil
+}
+
+// DeleteConversation removes a conversation and all its messages
+func DeleteConversation(db *sql.DB, conversationID string, userID int64) error {
+	_, err := db.Exec("DELETE FROM messages WHERE conversation_id = ? AND user_id = ?", conversationID, userID)
+	if err != nil {
+		return err
+	}
+	_, err = db.Exec("DELETE FROM conversations WHERE id = ? AND user_id = ?", conversationID, userID)
+	return err
 }

@@ -2,9 +2,18 @@ const BASE_URL = process.env.NEXT_PUBLIC_API_URL || "https://aryanssh.duckdns.or
 
 export type ChatMessage = {
   id?: number
+  conversation_id?: string
   role: "user" | "assistant"
   content: string
   created_at: string
+}
+
+export type Conversation = {
+  id: string
+  user_id: number
+  title: string
+  created_at: string
+  updated_at: string
 }
 
 type ApiError = { error?: string }
@@ -54,6 +63,32 @@ class ApiService {
     return data
   }
 
+  async getConversations() {
+    const data = await this.request<{ conversations: Conversation[] }>("/api/conversations")
+    return data.conversations || []
+  }
+
+  async createConversation(title?: string) {
+    return this.request<Conversation>("/api/conversations", {
+      method: "POST",
+      body: JSON.stringify({ title: title || "New Chat" }),
+    })
+  }
+
+  async getConversationMessages(id: string) {
+    const data = await this.request<{ messages: ChatMessage[] }>(`/api/conversations/${id}`)
+    return (data.messages || []).map((message) => ({
+      ...message,
+      content: message.role === "user" ? message.content.replace(/^Friend:\s*/i, "") : message.content,
+    }))
+  }
+
+  async deleteConversation(id: string) {
+    return this.request<{ message: string }>(`/api/conversations/${id}`, {
+      method: "DELETE",
+    })
+  }
+
   async getHistory() {
     const data = await this.request<{ history: ChatMessage[] }>("/api/chat/history")
     return (data.history || []).map((message) => ({
@@ -62,10 +97,10 @@ class ApiService {
     }))
   }
 
-  sendMessage(message: string) {
-    return this.request<{ reply: string; created_at: string }>("/api/chat", {
+  sendMessage(message: string, conversationId?: string) {
+    return this.request<{ reply: string; created_at: string; conversation_id: string }>("/api/chat", {
       method: "POST",
-      body: JSON.stringify({ message }),
+      body: JSON.stringify({ message, conversation_id: conversationId }),
     })
   }
 
