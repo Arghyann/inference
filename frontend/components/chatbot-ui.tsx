@@ -221,6 +221,7 @@ export default function ChatbotUI() {
         api.getConversations().then(setConversations).catch(() => {})
       }
     } catch (error) {
+      setInput(content)
       setMessages((current) => [...current, { role: "assistant", content: error instanceof Error ? error.message : "Something went wrong. Please try again.", created_at: new Date().toISOString() }])
     } finally {
       setIsLoading(false)

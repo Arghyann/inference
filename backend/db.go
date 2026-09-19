@@ -44,8 +44,10 @@ func InitDB(dbPath string) (*sql.DB, error) {
 	}
 
 	pragmas := `
+	PRAGMA foreign_keys = ON;
 	PRAGMA journal_mode = WAL;
 	PRAGMA cache_size = -2000;
+	PRAGMA busy_timeout = 5000;
 
 	CREATE TABLE IF NOT EXISTS users (
 		id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -157,23 +159,90 @@ func GenerateInviteCode(db *sql.DB) (string, error) {
 	return code, nil
 }
 
-// UseInviteCode validates and marks an invite code as used
+// UseInviteCode validates and marks an invite code as used atomically.
 func UseInviteCode(db *sql.DB, code, username string) error {
 	code = strings.ToUpper(strings.TrimSpace(code))
-	var isUsed bool
-	err := db.QueryRow("SELECT is_used FROM invite_codes WHERE code = ?", code).Scan(&isUsed)
-	if err == sql.ErrNoRows {
-		return fmt.Errorf("invalid invite code")
-	}
-	if err != nil {
-		return err
-	}
-	if isUsed {
-		return fmt.Errorf("invite code has already been used")
+	username = strings.ToLower(strings.TrimSpace(username))
+	if code == "" {
+		return fmt.Errorf("invite code cannot be empty")
 	}
 
-	_, err = db.Exec("UPDATE invite_codes SET is_used = 1, used_by_username = ? WHERE code = ?", username, username)
-	return err
+	res, err := db.Exec(
+		"UPDATE invite_codes SET is_used = 1, used_by_username = ? WHERE code = ? AND is_used = 0",
+		username, code,
+	)
+	if err != nil {
+		return fmt.Errorf("database error: %w", err)
+	}
+
+	rows, err := res.RowsAffected()
+	if err != nil {
+		return fmt.Errorf("database error: %w", err)
+	}
+	if rows == 0 {
+		var isUsed bool
+		err := db.QueryRow("SELECT is_used FROM invite_codes WHERE code = ?", code).Scan(&isUsed)
+		if err == sql.ErrNoRows {
+			return fmt.Errorf("invalid invite code")
+		}
+		if isUsed {
+			return fmt.Errorf("invite code has already been used")
+		}
+		return fmt.Errorf("failed to use invite code")
+	}
+	return nil
+}
+
+// RegisterUserWithInvite creates a user and marks the invite code as used in an atomic transaction
+func RegisterUserWithInvite(db *sql.DB, username, passwordHash, inviteCode string) (int64, error) {
+	username = strings.ToLower(strings.TrimSpace(username))
+	inviteCode = strings.ToUpper(strings.TrimSpace(inviteCode))
+
+	tx, err := db.Begin()
+	if err != nil {
+		return 0, fmt.Errorf("failed to begin transaction: %w", err)
+	}
+	defer tx.Rollback()
+
+	// Atomically burn the invite code
+	res, err := tx.Exec(
+		"UPDATE invite_codes SET is_used = 1, used_by_username = ? WHERE code = ? AND is_used = 0",
+		username, inviteCode,
+	)
+	if err != nil {
+		return 0, fmt.Errorf("database error: %w", err)
+	}
+
+	rows, err := res.RowsAffected()
+	if err != nil {
+		return 0, fmt.Errorf("database error: %w", err)
+	}
+	if rows == 0 {
+		var isUsed bool
+		err := tx.QueryRow("SELECT is_used FROM invite_codes WHERE code = ?", inviteCode).Scan(&isUsed)
+		if err == sql.ErrNoRows {
+			return 0, fmt.Errorf("invalid invite code")
+		}
+		if isUsed {
+			return 0, fmt.Errorf("invite code has already been used")
+		}
+		return 0, fmt.Errorf("failed to use invite code")
+	}
+
+	// Create user
+	userRes, err := tx.Exec(
+		"INSERT INTO users (username, password_hash, is_admin, is_approved) VALUES (?, ?, ?, ?)",
+		username, passwordHash, false, true,
+	)
+	if err != nil {
+		return 0, err
+	}
+
+	if err := tx.Commit(); err != nil {
+		return 0, fmt.Errorf("failed to commit transaction: %w", err)
+	}
+
+	return userRes.LastInsertId()
 }
 
 // SaveMessage stores a message in history
@@ -344,12 +413,28 @@ func SaveConversationMessage(db *sql.DB, conversationID string, userID int64, ro
 	return nil
 }
 
-// DeleteConversation removes a conversation and all its messages
+// DeleteConversation removes a conversation and all its messages atomically
 func DeleteConversation(db *sql.DB, conversationID string, userID int64) error {
-	_, err := db.Exec("DELETE FROM messages WHERE conversation_id = ? AND user_id = ?", conversationID, userID)
+	tx, err := db.Begin()
 	if err != nil {
 		return err
 	}
-	_, err = db.Exec("DELETE FROM conversations WHERE id = ? AND user_id = ?", conversationID, userID)
-	return err
+	defer tx.Rollback()
+
+	_, err = tx.Exec("DELETE FROM messages WHERE conversation_id = ? AND user_id = ?", conversationID, userID)
+	if err != nil {
+		return err
+	}
+	res, err := tx.Exec("DELETE FROM conversations WHERE id = ? AND user_id = ?", conversationID, userID)
+	if err != nil {
+		return err
+	}
+	rows, err := res.RowsAffected()
+	if err != nil {
+		return err
+	}
+	if rows == 0 {
+		return fmt.Errorf("conversation not found")
+	}
+	return tx.Commit()
 }

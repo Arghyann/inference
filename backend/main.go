@@ -16,6 +16,7 @@ import (
 	"github.com/joho/godotenv"
 	modal "github.com/modal-labs/modal-client/go"
 	"golang.org/x/crypto/acme/autocert"
+	"golang.org/x/term"
 )
 
 type Config struct {
@@ -43,7 +44,7 @@ func main() {
 	createInviteFlag := flag.Bool("create-invite", false, "Generate an invite code from CLI (SSH)")
 	createUserFlag := flag.Bool("create-user", false, "Directly create a user from CLI (SSH)")
 	usernameFlag := flag.String("u", "", "Username for user creation")
-	passwordFlag := flag.String("p", "", "Password for user creation")
+	passwordFlag := flag.String("p", "", "Password for user creation (optional; will prompt securely if omitted)")
 	flag.Parse()
 
 	cfg := Config{
@@ -52,6 +53,11 @@ func main() {
 		DBPath:    getEnv("DB_PATH", "./inference.db"),
 		Domain:    getEnv("DOMAIN", ""),
 		CertDir:   getEnv("CERT_DIR", "./certs"),
+	}
+
+	// Guard against default JWT secret in production
+	if cfg.Domain != "" && cfg.JWTSecret == "super-secret-default-key-change-in-production" {
+		log.Fatal("FATAL: Insecure default JWT_SECRET cannot be used when DOMAIN is configured for production. Please set JWT_SECRET in your .env file or environment.")
 	}
 
 	// 2. Initialize Database
@@ -73,18 +79,37 @@ func main() {
 
 	// SSH ADMIN COMMAND: Directly Create a User
 	if *createUserFlag {
-		if *usernameFlag == "" || *passwordFlag == "" {
-			log.Fatal("Usage: ./server-bin -create-user -u <username> -p <password>")
+		if *usernameFlag == "" {
+			log.Fatal("Usage: ./server-bin -create-user -u <username> [-p <password>]")
 		}
-		hash, err := HashPassword(*passwordFlag)
+		cleanUser := strings.ToLower(strings.TrimSpace(*usernameFlag))
+		if !isValidUsername(cleanUser) {
+			log.Fatal("Username must be between 3 and 30 characters (letters, numbers, '-', '_')")
+		}
+
+		password := *passwordFlag
+		if password == "" {
+			fmt.Print("Enter password for user: ")
+			bytePassword, err := term.ReadPassword(int(os.Stdin.Fd()))
+			fmt.Println()
+			if err != nil {
+				log.Fatalf("Failed to read password: %v", err)
+			}
+			password = strings.TrimSpace(string(bytePassword))
+		}
+		if len(password) < 6 || len(password) > 72 {
+			log.Fatal("Password must be between 6 and 72 characters")
+		}
+
+		hash, err := HashPassword(password)
 		if err != nil {
 			log.Fatalf("Error hashing password: %v", err)
 		}
-		id, err := CreateUser(db, *usernameFlag, hash, false, true)
+		id, err := CreateUser(db, cleanUser, hash, false, true)
 		if err != nil {
 			log.Fatalf("Failed to create user: %v", err)
 		}
-		fmt.Printf("Successfully created user '%s' (ID: %d)\n", *usernameFlag, id)
+		fmt.Printf("Successfully created user '%s' (ID: %d)\n", cleanUser, id)
 		return
 	}
 
@@ -127,26 +152,30 @@ func main() {
 	// 4. Register HTTP Routes (NO ADMIN ROUTES EXPOSED OVER HTTP)
 	mux := http.NewServeMux()
 
-	// In-memory IP Rate Limiters (5 attempts/min for login, 3 attempts/min for register)
+	// In-memory IP Rate Limiters
 	loginLimiter := NewIPRateLimiter(5, 1*time.Minute)
 	registerLimiter := NewIPRateLimiter(3, 1*time.Minute)
+	chatLimiter := NewIPRateLimiter(15, 1*time.Minute)
+	warmupLimiter := NewIPRateLimiter(5, 1*time.Minute)
 
 	// Public Auth routes (Protected by IP rate limiting; register requires an invite code generated via SSH)
 	mux.HandleFunc("POST /api/auth/register", RateLimitMiddleware(registerLimiter, server.handleRegister))
 	mux.HandleFunc("POST /api/auth/login", RateLimitMiddleware(loginLimiter, server.handleLogin))
 
-	// Protected Chat & Conversation routes (Bearer JWT required)
+	// Protected Chat & Conversation routes (Bearer JWT required + Rate Limited)
 	mux.HandleFunc("GET /api/conversations", server.requireAuth(server.handleListConversations))
 	mux.HandleFunc("POST /api/conversations", server.requireAuth(server.handleCreateConversation))
 	mux.HandleFunc("GET /api/conversations/{id}", server.requireAuth(server.handleGetConversation))
 	mux.HandleFunc("DELETE /api/conversations/{id}", server.requireAuth(server.handleDeleteConversation))
-	mux.HandleFunc("POST /api/chat", server.requireAuth(server.handleChat))
+	mux.HandleFunc("POST /api/chat", RateLimitMiddleware(chatLimiter, server.requireAuth(server.handleChat)))
 	mux.HandleFunc("GET /api/chat/history", server.requireAuth(server.handleChatHistory))
 	mux.HandleFunc("GET /api/chat/status", server.requireAuth(server.handleGpuStatus))
-	mux.HandleFunc("POST /api/chat/warmup", server.requireAuth(server.handleWarmup))
+	mux.HandleFunc("POST /api/chat/warmup", RateLimitMiddleware(warmupLimiter, server.requireAuth(server.handleWarmup)))
 
-	// CORS handler to allow any frontend (localhost or production domain) to connect
+	// Security headers & CORS handler
 	corsHandler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("X-Content-Type-Options", "nosniff")
+		w.Header().Set("X-Frame-Options", "DENY")
 		w.Header().Set("Access-Control-Allow-Origin", "*")
 		w.Header().Set("Access-Control-Allow-Methods", "GET, POST, DELETE, OPTIONS")
 		w.Header().Set("Access-Control-Allow-Headers", "Content-Type, Authorization")
@@ -160,6 +189,10 @@ func main() {
 	})
 
 	if cfg.Domain != "" {
+		if os.Getenv("TRUST_PROXY") == "" {
+			_ = os.Setenv("TRUST_PROXY", "false")
+		}
+
 		if err := os.MkdirAll(cfg.CertDir, 0700); err != nil {
 			log.Fatalf("Failed to create cert directory: %v", err)
 		}
@@ -171,15 +204,27 @@ func main() {
 		}
 
 		httpsServer := &http.Server{
-			Addr:      ":443",
-			Handler:   corsHandler,
-			TLSConfig: certManager.TLSConfig(),
+			Addr:              ":443",
+			Handler:           corsHandler,
+			TLSConfig:         certManager.TLSConfig(),
+			ReadHeaderTimeout: 10 * time.Second,
+			ReadTimeout:       30 * time.Second,
+			WriteTimeout:      130 * time.Second,
+			IdleTimeout:       120 * time.Second,
 		}
 
 		// Handle Let's Encrypt HTTP-01 challenge and redirect HTTP to HTTPS
 		go func() {
 			fmt.Println("HTTP server listening on :80 (ACME challenges & HTTPS redirect)")
-			if err := http.ListenAndServe(":80", certManager.HTTPHandler(nil)); err != nil {
+			challengeServer := &http.Server{
+				Addr:              ":80",
+				Handler:           certManager.HTTPHandler(nil),
+				ReadHeaderTimeout: 5 * time.Second,
+				ReadTimeout:       10 * time.Second,
+				WriteTimeout:      10 * time.Second,
+				IdleTimeout:       30 * time.Second,
+			}
+			if err := challengeServer.ListenAndServe(); err != nil {
 				log.Printf("HTTP challenge server stopped: %v", err)
 			}
 		}()
@@ -190,13 +235,33 @@ func main() {
 		}
 	} else {
 		fmt.Printf("Inference Backend listening on http://localhost:%s\n", cfg.Port)
-		if err := http.ListenAndServe(":"+cfg.Port, corsHandler); err != nil {
+		httpServer := &http.Server{
+			Addr:              ":" + cfg.Port,
+			Handler:           corsHandler,
+			ReadHeaderTimeout: 10 * time.Second,
+			ReadTimeout:       30 * time.Second,
+			WriteTimeout:      130 * time.Second,
+			IdleTimeout:       120 * time.Second,
+		}
+		if err := httpServer.ListenAndServe(); err != nil {
 			log.Fatalf("Server stopped: %v", err)
 		}
 	}
 }
 
 // ================= HTTP HANDLERS ================= //
+
+func isValidUsername(u string) bool {
+	if len(u) < 3 || len(u) > 30 {
+		return false
+	}
+	for _, ch := range u {
+		if !((ch >= 'a' && ch <= 'z') || (ch >= '0' && ch <= '9') || ch == '_' || ch == '-') {
+			return false
+		}
+	}
+	return true
+}
 
 type RegisterRequest struct {
 	Username   string `json:"username"`
@@ -211,11 +276,20 @@ func (s *AppServer) handleRegister(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	req.Username = strings.TrimSpace(req.Username)
-	req.InviteCode = strings.TrimSpace(req.InviteCode)
+	req.Username = strings.ToLower(strings.TrimSpace(req.Username))
+	req.InviteCode = strings.ToUpper(strings.TrimSpace(req.InviteCode))
 
-	if req.Username == "" || len(req.Password) < 6 {
-		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "Username required, password must be at least 6 characters"})
+	if !isValidUsername(req.Username) {
+		writeJSON(w, http.StatusBadRequest, map[string]string{
+			"error": "Username must be 3-30 characters (letters, numbers, '-', '_')",
+		})
+		return
+	}
+
+	if len(req.Password) < 6 || len(req.Password) > 72 {
+		writeJSON(w, http.StatusBadRequest, map[string]string{
+			"error": "Password must be between 6 and 72 characters",
+		})
 		return
 	}
 
@@ -227,9 +301,9 @@ func (s *AppServer) handleRegister(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Validate and burn the invite code
-	if err := UseInviteCode(s.db, req.InviteCode, req.Username); err != nil {
-		writeJSON(w, http.StatusForbidden, map[string]string{"error": err.Error()})
+	// Check if username already exists to avoid unnecessary bcrypt hashing
+	if existing, _ := GetUserByUsername(s.db, req.Username); existing != nil {
+		writeJSON(w, http.StatusConflict, map[string]string{"error": "Username already exists"})
 		return
 	}
 
@@ -239,13 +313,18 @@ func (s *AppServer) handleRegister(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	_, err = CreateUser(s.db, req.Username, hash, false, true)
+	// Atomically burn the invite code and create user in a single transaction
+	_, err = RegisterUserWithInvite(s.db, req.Username, hash, req.InviteCode)
 	if err != nil {
+		if strings.Contains(err.Error(), "already been used") || strings.Contains(err.Error(), "invalid invite code") {
+			writeJSON(w, http.StatusForbidden, map[string]string{"error": err.Error()})
+			return
+		}
 		if strings.Contains(err.Error(), "UNIQUE") {
 			writeJSON(w, http.StatusConflict, map[string]string{"error": "Username already exists"})
 			return
 		}
-		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "Failed to create user"})
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "Registration failed"})
 		return
 	}
 
@@ -263,6 +342,12 @@ func (s *AppServer) handleLogin(w http.ResponseWriter, r *http.Request) {
 	var req LoginRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "Invalid request body"})
+		return
+	}
+
+	req.Username = strings.ToLower(strings.TrimSpace(req.Username))
+	if req.Username == "" || req.Password == "" || len(req.Password) > 72 {
+		writeJSON(w, http.StatusUnauthorized, map[string]string{"error": "Invalid username or password"})
 		return
 	}
 
@@ -318,6 +403,10 @@ func (s *AppServer) handleChat(w http.ResponseWriter, r *http.Request, claims *C
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "Message cannot be empty"})
 		return
 	}
+	if len(prompt) > 4000 {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "Message exceeds maximum limit of 4000 characters"})
+		return
+	}
 
 	conversationID := strings.TrimSpace(req.ConversationID)
 	if conversationID == "" {
@@ -329,16 +418,16 @@ func (s *AppServer) handleChat(w http.ResponseWriter, r *http.Request, claims *C
 		}
 		conversationID = conv.ID
 	} else {
-		// Verify conversation exists or create it
-		conv, _ := GetConversationByID(s.db, conversationID, claims.UserID)
+		// Verify conversation exists and strictly belongs to this user
+		conv, err := GetConversationByID(s.db, conversationID, claims.UserID)
+		if err != nil {
+			log.Printf("Error verifying conversation: %v", err)
+			writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "Failed to verify conversation"})
+			return
+		}
 		if conv == nil {
-			conv, err := CreateConversation(s.db, conversationID, "New Chat", claims.UserID)
-			if err != nil {
-				log.Printf("Error initializing conversation: %v", err)
-				writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "Failed to initialize conversation"})
-				return
-			}
-			conversationID = conv.ID
+			writeJSON(w, http.StatusNotFound, map[string]string{"error": "Conversation not found"})
+			return
 		}
 	}
 
@@ -415,7 +504,12 @@ type CreateConversationRequest struct {
 func (s *AppServer) handleCreateConversation(w http.ResponseWriter, r *http.Request, claims *Claims) {
 	var req CreateConversationRequest
 	_ = json.NewDecoder(r.Body).Decode(&req)
-	conv, err := CreateConversation(s.db, "", req.Title, claims.UserID)
+	title := strings.TrimSpace(req.Title)
+	if len(title) > 100 {
+		runes := []rune(title)
+		title = string(runes[:100])
+	}
+	conv, err := CreateConversation(s.db, "", title, claims.UserID)
 	if err != nil {
 		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "Failed to create conversation"})
 		return
@@ -429,6 +523,16 @@ func (s *AppServer) handleGetConversation(w http.ResponseWriter, r *http.Request
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "Conversation ID required"})
 		return
 	}
+	conv, err := GetConversationByID(s.db, id, claims.UserID)
+	if err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "Failed to fetch conversation"})
+		return
+	}
+	if conv == nil {
+		writeJSON(w, http.StatusNotFound, map[string]string{"error": "Conversation not found"})
+		return
+	}
+
 	messages, err := GetConversationMessages(s.db, id, claims.UserID, 50)
 	if err != nil {
 		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "Failed to fetch messages"})
@@ -448,6 +552,16 @@ func (s *AppServer) handleDeleteConversation(w http.ResponseWriter, r *http.Requ
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "Conversation ID required"})
 		return
 	}
+	conv, err := GetConversationByID(s.db, id, claims.UserID)
+	if err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "Failed to find conversation"})
+		return
+	}
+	if conv == nil {
+		writeJSON(w, http.StatusNotFound, map[string]string{"error": "Conversation not found"})
+		return
+	}
+
 	if err := DeleteConversation(s.db, id, claims.UserID); err != nil {
 		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "Failed to delete conversation"})
 		return

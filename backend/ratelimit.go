@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"net"
 	"net/http"
+	"os"
 	"strings"
 	"sync"
 	"time"
@@ -108,19 +109,22 @@ func (l *IPRateLimiter) Stop() {
 }
 
 // GetClientIP extracts the real client IP address from standard proxy headers or RemoteAddr.
+// If TRUST_PROXY is set to "false", proxy headers are ignored to prevent spoofing.
 func GetClientIP(r *http.Request) string {
-	if xff := r.Header.Get("X-Forwarded-For"); xff != "" {
-		parts := strings.Split(xff, ",")
-		ip := strings.TrimSpace(parts[0])
-		if ip != "" {
-			return ip
+	if os.Getenv("TRUST_PROXY") != "false" {
+		if xff := r.Header.Get("X-Forwarded-For"); xff != "" {
+			parts := strings.Split(xff, ",")
+			ip := strings.TrimSpace(parts[0])
+			if ip != "" {
+				return ip
+			}
 		}
-	}
 
-	if realIP := r.Header.Get("X-Real-IP"); realIP != "" {
-		ip := strings.TrimSpace(realIP)
-		if ip != "" {
-			return ip
+		if realIP := r.Header.Get("X-Real-IP"); realIP != "" {
+			ip := strings.TrimSpace(realIP)
+			if ip != "" {
+				return ip
+			}
 		}
 	}
 

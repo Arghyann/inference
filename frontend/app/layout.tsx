@@ -13,19 +13,17 @@ export const metadata: Metadata = {
   icons: {
     icon: [
       {
-        url: '/icon-light-32x32.png',
-        media: '(prefers-color-scheme: light)',
+        url: '/icons8-favicon-doodle-16.png',
+        sizes: '16x16',
+        type: 'image/png',
       },
       {
-        url: '/icon-dark-32x32.png',
-        media: '(prefers-color-scheme: dark)',
-      },
-      {
-        url: '/icon.svg',
-        type: 'image/svg+xml',
+        url: '/icons8-favicon-doodle-96.png',
+        sizes: '96x96',
+        type: 'image/png',
       },
     ],
-    apple: '/apple-icon.png',
+    apple: '/icons8-favicon-doodle-96.png',
   },
 }
 
