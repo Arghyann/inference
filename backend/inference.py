@@ -30,7 +30,7 @@ SYSTEM_PROMPT = (
     image=image,
     gpu="T4",                     # Cost-effective T4 GPU ($0.000164/sec)
     volumes={"/data": volume},
-    scaledown_window=300,         # Idle container lives for 5m to avoid cold starts
+    scaledown_window=120,         # Idle container lives for 2m to minimize GPU cost
     max_containers=1,             # Cap at 1 GPU shared across backend clients
 )
 class ChatModel:

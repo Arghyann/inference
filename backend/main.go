@@ -579,7 +579,7 @@ func (s *AppServer) handleDeleteConversation(w http.ResponseWriter, r *http.Requ
 	})
 }
 
-const idleWindow = 300 * time.Second // Matches Modal's scaledown_window (5 minutes)
+const idleWindow = 120 * time.Second // Matches Modal's scaledown_window (2 minutes)
 
 func (s *AppServer) handleGpuStatus(w http.ResponseWriter, r *http.Request, claims *Claims) {
 	s.lastActivityMu.RLock()
