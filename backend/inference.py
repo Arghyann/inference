@@ -16,33 +16,45 @@ image = (
         "bitsandbytes",
     )
     .env({
-        # Cache HuggingFace base model weights directly in the mounted volume
         "HF_HOME": "/data/cache/huggingface"
     })
 )
 
+SYSTEM_PROMPT = (
+    "You are Aryan. Respond exactly as Aryan would — in his natural "
+    "texting style, casual mix of Hindi and English (Hinglish), short "
+    "punchy replies, never formal. Never break character."
+)
+
 @app.cls(
     image=image,
-    gpu="T4",                     # Lowest billing rate ($0.000164/sec)
+    gpu="T4",                     # Cost-effective T4 GPU ($0.000164/sec)
     volumes={"/data": volume},
-    scaledown_window=300,         # Shut down after 5m idle (prevents rapid cold starts)
-    max_containers=1,             # Cap at 1 GPU; all users share the same warm container
+    scaledown_window=300,         # Idle container lives for 5m to avoid cold starts
+    max_containers=1,             # Cap at 1 GPU shared across backend clients
 )
 class ChatModel:
     @modal.enter()
     def load_model(self):
         from unsloth import FastLanguageModel
 
-        checkpoint_path = "/data/aryan-"
+        # Base model with v2 adapter as default
+        checkpoint_v2 = "/data/aryan-llama-lora-v2"
+        checkpoint_v1 = "/data/aryan-"
+        print(f"Loading base model + v2 adapter from {checkpoint_v2}...")
 
-        # Loads base model (from /data/cache) + mounts LoRA adapter
         self.model, self.tokenizer = FastLanguageModel.from_pretrained(
-            model_name=checkpoint_path,
+            model_name=checkpoint_v2,
             max_seq_length=2048,
             dtype=None,
             load_in_4bit=True,
         )
+
+        print(f"Loading v1 adapter from {checkpoint_v1}...")
+        self.model.load_adapter(checkpoint_v1, adapter_name="v1")
+
         FastLanguageModel.for_inference(self.model)
+        print("Both v1 and v2 adapters loaded into single GPU VRAM and ready!")
 
     @modal.method()
     def warmup(self) -> str:
@@ -50,19 +62,19 @@ class ChatModel:
         return "ready"
 
     @modal.method()
-    def generate(self, history: list) -> str:
+    def generate(self, history: list, model: str = "v2") -> str:
         import torch
 
-        messages = [
-            {
-                "role": "system",
-                "content": (
-                    "You are Aryan. Respond exactly as Aryan would — in his natural "
-                    "texting style, casual mix of Hindi and English (Hinglish), short "
-                    "punchy replies, never formal. Never break character."
-                ),
-            }
-        ] + history
+        # Switch active adapter instantly (<1ms) on the same GPU
+        target_adapter = "v1" if model == "v1" else "default"
+        try:
+            self.model.set_adapter(target_adapter)
+        except Exception as e:
+            print(f"Error setting adapter to {target_adapter}, falling back to default: {e}")
+            self.model.set_adapter("default")
+
+        # Inject system prompt at the beginning of conversational history
+        messages = [{"role": "system", "content": SYSTEM_PROMPT}] + history
 
         inputs = self.tokenizer.apply_chat_template(
             messages,

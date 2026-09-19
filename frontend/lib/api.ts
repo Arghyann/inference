@@ -5,6 +5,7 @@ export type ChatMessage = {
   conversation_id?: string
   role: "user" | "assistant"
   content: string
+  model?: string
   created_at: string
 }
 
@@ -97,10 +98,10 @@ class ApiService {
     }))
   }
 
-  sendMessage(message: string, conversationId?: string) {
-    return this.request<{ reply: string; created_at: string; conversation_id: string }>("/api/chat", {
+  sendMessage(message: string, conversationId?: string, model: "v1" | "v2" = "v2") {
+    return this.request<{ reply: string; created_at: string; conversation_id: string; model: string }>("/api/chat", {
       method: "POST",
-      body: JSON.stringify({ message, conversation_id: conversationId }),
+      body: JSON.stringify({ message, conversation_id: conversationId, model }),
     })
   }
 

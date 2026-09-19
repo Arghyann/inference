@@ -33,6 +33,7 @@ type Message struct {
 	ConversationID string    `json:"conversation_id,omitempty"`
 	Role           string    `json:"role"`    // "user" or "assistant"
 	Content        string    `json:"content"` // message text
+	Model          string    `json:"model,omitempty"` // "v1" or "v2"
 	CreatedAt      time.Time `json:"created_at,omitempty"`
 }
 
@@ -83,6 +84,7 @@ func InitDB(dbPath string) (*sql.DB, error) {
 		user_id INTEGER NOT NULL,
 		role TEXT NOT NULL,
 		content TEXT NOT NULL,
+		model TEXT DEFAULT 'v2',
 		created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
 		FOREIGN KEY(user_id) REFERENCES users(id) ON DELETE CASCADE,
 		FOREIGN KEY(conversation_id) REFERENCES conversations(id) ON DELETE CASCADE
@@ -98,6 +100,7 @@ func InitDB(dbPath string) (*sql.DB, error) {
 	// Safe migration: Add conversation_id column to messages table if table already existed
 	_, _ = db.Exec("ALTER TABLE messages ADD COLUMN conversation_id TEXT;")
 	_, _ = db.Exec("CREATE INDEX IF NOT EXISTS idx_messages_conv_id ON messages(conversation_id, created_at);")
+	_, _ = db.Exec("ALTER TABLE messages ADD COLUMN model TEXT DEFAULT 'v2';")
 
 	return db, nil
 }
@@ -355,8 +358,8 @@ func GetConversationMessages(db *sql.DB, conversationID string, userID int64, li
 		limit = 50
 	}
 	query := `
-	SELECT id, role, content, created_at FROM (
-		SELECT id, role, content, created_at 
+	SELECT id, role, content, COALESCE(model, 'v2'), created_at FROM (
+		SELECT id, role, content, model, created_at 
 		FROM messages 
 		WHERE conversation_id = ? AND user_id = ? 
 		ORDER BY created_at DESC 
@@ -373,7 +376,7 @@ func GetConversationMessages(db *sql.DB, conversationID string, userID int64, li
 	for rows.Next() {
 		var m Message
 		m.ConversationID = conversationID
-		if err := rows.Scan(&m.ID, &m.Role, &m.Content, &m.CreatedAt); err != nil {
+		if err := rows.Scan(&m.ID, &m.Role, &m.Content, &m.Model, &m.CreatedAt); err != nil {
 			return nil, err
 		}
 		messages = append(messages, m)
@@ -382,11 +385,15 @@ func GetConversationMessages(db *sql.DB, conversationID string, userID int64, li
 }
 
 // SaveConversationMessage stores a message in a specific conversation and updates its timestamp
-func SaveConversationMessage(db *sql.DB, conversationID string, userID int64, role, content string) error {
+func SaveConversationMessage(db *sql.DB, conversationID string, userID int64, role, content string, model ...string) error {
 	now := time.Now().UTC()
+	msgModel := "v2"
+	if len(model) > 0 && model[0] != "" {
+		msgModel = model[0]
+	}
 	_, err := db.Exec(
-		"INSERT INTO messages (conversation_id, user_id, role, content, created_at) VALUES (?, ?, ?, ?, ?)",
-		conversationID, userID, role, content, now,
+		"INSERT INTO messages (conversation_id, user_id, role, content, model, created_at) VALUES (?, ?, ?, ?, ?, ?)",
+		conversationID, userID, role, content, msgModel, now,
 	)
 	if err != nil {
 		return err

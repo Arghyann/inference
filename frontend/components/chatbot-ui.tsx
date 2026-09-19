@@ -1,7 +1,7 @@
 "use client"
 
 import { FormEvent, KeyboardEvent, useEffect, useRef, useState } from "react"
-import { ArrowUp, LogOut, MessageSquare, PanelLeft, Plus, Sparkles, Trash2, UserRound, X, Zap } from "lucide-react"
+import { ArrowUp, ChevronDown, LogOut, MessageSquare, PanelLeft, Plus, Sparkles, Trash2, UserRound, X, Zap } from "lucide-react"
 import { api, ChatMessage, Conversation } from "@/lib/api"
 
 type AuthMode = "login" | "register"
@@ -24,6 +24,7 @@ export default function ChatbotUI() {
   const [authLoading, setAuthLoading] = useState(false)
   const [gpuWarm, setGpuWarm] = useState<boolean | null>(null)
   const [isWarmingUp, setIsWarmingUp] = useState(false)
+  const [selectedModel, setSelectedModel] = useState<"v1" | "v2">("v2")
   const messagesEndRef = useRef<HTMLDivElement>(null)
 
   useEffect(() => {
@@ -211,8 +212,16 @@ export default function ChatbotUI() {
     setMessages((current) => [...current, { role: "user", content, created_at: new Date().toISOString() }])
     setIsLoading(true)
     try {
-      const response = await api.sendMessage(content, activeConversationId || undefined)
-      setMessages((current) => [...current, { role: "assistant", content: response.reply, created_at: response.created_at }])
+      const response = await api.sendMessage(content, activeConversationId || undefined, selectedModel)
+      setMessages((current) => [
+        ...current,
+        {
+          role: "assistant",
+          content: response.reply,
+          model: response.model || selectedModel,
+          created_at: response.created_at,
+        },
+      ])
       setGpuWarm(true)
 
       // If we were on a brand new chat, set active ID and refresh conversation list
@@ -222,7 +231,15 @@ export default function ChatbotUI() {
       }
     } catch (error) {
       setInput(content)
-      setMessages((current) => [...current, { role: "assistant", content: error instanceof Error ? error.message : "Something went wrong. Please try again.", created_at: new Date().toISOString() }])
+      setMessages((current) => [
+        ...current,
+        {
+          role: "assistant",
+          content: error instanceof Error ? error.message : "Something went wrong. Please try again.",
+          model: selectedModel,
+          created_at: new Date().toISOString(),
+        },
+      ])
     } finally {
       setIsLoading(false)
     }
@@ -404,6 +421,20 @@ export default function ChatbotUI() {
             </div>
 
             <div className="flex items-center gap-2 shrink-0">
+              {/* Model Dropdown */}
+              <div className="relative">
+                <select
+                  value={selectedModel}
+                  onChange={(e) => setSelectedModel(e.target.value as "v1" | "v2")}
+                  aria-label="Select AI Model Version"
+                  className="h-8 appearance-none rounded-full border border-white/15 bg-white/[0.06] pl-3 pr-7 text-xs font-medium text-white transition hover:bg-white/[0.1] focus:border-lime-400/60 focus:outline-none cursor-pointer"
+                >
+                  <option value="v2" className="bg-[#121513] text-white">Aryan v2 (Natural)</option>
+                  <option value="v1" className="bg-[#121513] text-white">Aryan v1 (Legacy)</option>
+                </select>
+                <ChevronDown className="pointer-events-none absolute right-2.5 top-1/2 -translate-y-1/2 size-3 text-white/50" />
+              </div>
+
               {isWarmingUp ? (
                 <div className="flex items-center gap-2 rounded-full border border-amber-400/30 bg-amber-400/10 px-3 py-1.5 text-xs text-amber-300">
                   <span className="size-2 animate-ping rounded-full bg-amber-400" />
@@ -443,13 +474,27 @@ export default function ChatbotUI() {
                   <Sparkles />
                 </div>
                 <h2 className="text-2xl font-semibold">What can I help with?</h2>
-                <p className="mt-2 text-sm text-white/45">Ask Aryan AI anything about projects, ideas, or technical work.</p>
+                <p className="mt-2 text-sm text-white/45">
+                  Ask Aryan AI anything. Currently active:{" "}
+                  <span className={selectedModel === "v1" ? "text-amber-300 font-medium" : "text-lime-400 font-medium"}>
+                    {selectedModel === "v1" ? "Aryan v1 (Legacy)" : "Aryan v2 (Natural)"}
+                  </span>
+                </p>
               </div>
             ) : (
               <div className="mx-auto max-w-2xl space-y-6">
                 {messages.map((message, index) => (
                   <div key={`${message.created_at}-${index}`} className={`flex gap-3 ${message.role === "user" ? "justify-end" : "justify-start"}`}>
                     <div className={`max-w-[85%] rounded-2xl px-4 py-3 text-sm leading-6 ${message.role === "user" ? "bg-lime-400 text-black" : "border border-white/10 bg-white/[0.06] text-white/85"}`}>
+                      {message.role === "assistant" && (
+                        <div className="mb-1 flex items-center gap-1.5 text-[10px] font-mono uppercase tracking-wider text-white/40">
+                          <span>Aryan AI</span>
+                          <span>•</span>
+                          <span className={message.model === "v1" ? "text-amber-300 font-semibold" : "text-lime-400 font-semibold"}>
+                            {message.model === "v1" ? "v1" : "v2"}
+                          </span>
+                        </div>
+                      )}
                       <p className="whitespace-pre-wrap">{message.content}</p>
                     </div>
                   </div>

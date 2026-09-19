@@ -383,12 +383,14 @@ func (s *AppServer) handleLogin(w http.ResponseWriter, r *http.Request) {
 type ChatRequest struct {
 	Message        string `json:"message"`
 	ConversationID string `json:"conversation_id,omitempty"`
+	Model          string `json:"model,omitempty"`
 }
 
 type ChatResponse struct {
 	Reply          string    `json:"reply"`
 	CreatedAt      time.Time `json:"created_at"`
 	ConversationID string    `json:"conversation_id"`
+	Model          string    `json:"model"`
 }
 
 func (s *AppServer) handleChat(w http.ResponseWriter, r *http.Request, claims *Claims) {
@@ -406,6 +408,11 @@ func (s *AppServer) handleChat(w http.ResponseWriter, r *http.Request, claims *C
 	if len(prompt) > 4000 {
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "Message exceeds maximum limit of 4000 characters"})
 		return
+	}
+
+	modelChoice := strings.ToLower(strings.TrimSpace(req.Model))
+	if modelChoice != "v1" && modelChoice != "v2" {
+		modelChoice = "v2"
 	}
 
 	conversationID := strings.TrimSpace(req.ConversationID)
@@ -455,7 +462,7 @@ func (s *AppServer) handleChat(w http.ResponseWriter, r *http.Request, claims *C
 	ctx, cancel := context.WithTimeout(r.Context(), 120*time.Second)
 	defer cancel()
 
-	res, err := s.modalGenerate.Remote(ctx, []any{payload}, nil)
+	res, err := s.modalGenerate.Remote(ctx, []any{payload, modelChoice}, nil)
 	if err != nil {
 		log.Printf("Modal invocation error: %v", err)
 		writeJSON(w, http.StatusBadGateway, map[string]string{"error": "Model inference failed. Please try again."})
@@ -473,13 +480,14 @@ func (s *AppServer) handleChat(w http.ResponseWriter, r *http.Request, claims *C
 	s.lastActivityMu.Unlock()
 
 	// 4. Save user message and AI reply into SQLite under this conversation
-	_ = SaveConversationMessage(s.db, conversationID, claims.UserID, "user", fmt.Sprintf("Friend: %s", prompt))
-	_ = SaveConversationMessage(s.db, conversationID, claims.UserID, "assistant", reply)
+	_ = SaveConversationMessage(s.db, conversationID, claims.UserID, "user", fmt.Sprintf("Friend: %s", prompt), modelChoice)
+	_ = SaveConversationMessage(s.db, conversationID, claims.UserID, "assistant", reply, modelChoice)
 
 	writeJSON(w, http.StatusOK, ChatResponse{
 		Reply:          reply,
 		CreatedAt:      time.Now().UTC(),
 		ConversationID: conversationID,
+		Model:          modelChoice,
 	})
 }
 
