@@ -108,6 +108,7 @@ export interface ApiError {
   - `400 Bad Request`: `{"error": "Username required, password must be at least 6 characters"}`
   - `403 Forbidden`: `{"error": "Registration is invite-only. Please provide a valid invite code from the admin."}` or `{"error": "Invalid or expired invite code"}`
   - `409 Conflict`: `{"error": "Username already exists"}`
+  - `429 Too Many Requests`: `{"error": "Too many attempts. Please wait 45 seconds and try again."}` (Limit: 3 requests/min per IP)
 
 ---
 
@@ -131,6 +132,7 @@ export interface ApiError {
     ```
   - `401 Unauthorized`: `{"error": "Invalid username or password"}`
   - `403 Forbidden`: `{"error": "Account not approved."}`
+  - `429 Too Many Requests`: `{"error": "Too many attempts. Please wait 30 seconds and try again."}` (Limit: 5 requests/min per IP)
 
 ---
 
@@ -190,6 +192,44 @@ Fetches the user's prior conversation history (up to the last 20 messages).
 > ```typescript
 > const displayContent = msg.role === 'user' ? msg.content.replace(/^Friend:\s*/i, '') : msg.content;
 > ```
+
+---
+
+### 4.5 Check GPU Status
+Returns whether the GPU container on Modal is warm or sleeping, along with remaining idle seconds before scale-down.
+- **URL:** `GET /api/chat/status`
+- **Auth:** Required (`Authorization: Bearer <TOKEN>`)
+- **Responses:**
+  - `200 OK`:
+    ```json
+    {
+      "warm": true,
+      "seconds_remaining": 284
+    }
+    ```
+    or when sleeping:
+    ```json
+    {
+      "warm": false,
+      "seconds_remaining": 0
+    }
+    ```
+
+---
+
+### 4.6 Warm Up GPU Container
+Pings Modal to pre-warm the container and load model weights without running generation, eliminating cold-start delay for the next user message.
+- **URL:** `POST /api/chat/warmup`
+- **Auth:** Required (`Authorization: Bearer <TOKEN>`)
+- **Responses:**
+  - `200 OK`:
+    ```json
+    {
+      "status": "ready",
+      "seconds_remaining": 300
+    }
+    ```
+  - `502 Bad Gateway`: `{"error": "Failed to warm up GPU container. Please try again."}`
 
 ---
 
@@ -276,7 +316,19 @@ class ApiService {
     }));
   }
 
-  // 5. Logout
+  // 5. Check GPU Status
+  async getGpuStatus() {
+    return this.request<{ warm: boolean; seconds_remaining: number }>('/api/chat/status');
+  }
+
+  // 6. Pre-warm GPU Container
+  async warmup() {
+    return this.request<{ status: string; seconds_remaining: number }>('/api/chat/warmup', {
+      method: 'POST',
+    });
+  }
+
+  // 7. Logout
   logout() {
     if (typeof window !== 'undefined') {
       localStorage.removeItem('auth_token');

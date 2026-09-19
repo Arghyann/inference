@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"os"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/joho/godotenv"
@@ -26,9 +27,12 @@ type Config struct {
 }
 
 type AppServer struct {
-	db            *sql.DB
-	modalFunction *modal.Function
-	jwtSecret     []byte
+	db             *sql.DB
+	modalGenerate  *modal.Function
+	modalWarmup    *modal.Function
+	jwtSecret      []byte
+	lastActivityMu sync.RWMutex
+	lastActivity   time.Time
 }
 
 func main() {
@@ -102,28 +106,40 @@ func main() {
 		log.Fatalf("Failed to instantiate ChatModel: %v", err)
 	}
 
-	method, err := instance.Method("generate")
+	generateMethod, err := instance.Method("generate")
 	if err != nil {
 		log.Fatalf("Failed to find generate method: %v", err)
 	}
 	fmt.Println("Connected to Modal ChatModel successfully!")
 
+	warmupMethod, err := instance.Method("warmup")
+	if err != nil {
+		log.Printf("Warmup method not found on Modal (will fallback to generate on first use): %v", err)
+	}
+
 	server := &AppServer{
 		db:            db,
-		modalFunction: method,
+		modalGenerate: generateMethod,
+		modalWarmup:   warmupMethod,
 		jwtSecret:     []byte(cfg.JWTSecret),
 	}
 
 	// 4. Register HTTP Routes (NO ADMIN ROUTES EXPOSED OVER HTTP)
 	mux := http.NewServeMux()
 
-	// Public Auth routes (Register strictly requires an invite code generated via SSH)
-	mux.HandleFunc("POST /api/auth/register", server.handleRegister)
-	mux.HandleFunc("POST /api/auth/login", server.handleLogin)
+	// In-memory IP Rate Limiters (5 attempts/min for login, 3 attempts/min for register)
+	loginLimiter := NewIPRateLimiter(5, 1*time.Minute)
+	registerLimiter := NewIPRateLimiter(3, 1*time.Minute)
+
+	// Public Auth routes (Protected by IP rate limiting; register requires an invite code generated via SSH)
+	mux.HandleFunc("POST /api/auth/register", RateLimitMiddleware(registerLimiter, server.handleRegister))
+	mux.HandleFunc("POST /api/auth/login", RateLimitMiddleware(loginLimiter, server.handleLogin))
 
 	// Protected Chat routes (Bearer JWT required)
 	mux.HandleFunc("POST /api/chat", server.requireAuth(server.handleChat))
 	mux.HandleFunc("GET /api/chat/history", server.requireAuth(server.handleChatHistory))
+	mux.HandleFunc("GET /api/chat/status", server.requireAuth(server.handleGpuStatus))
+	mux.HandleFunc("POST /api/chat/warmup", server.requireAuth(server.handleWarmup))
 
 	// CORS handler to allow any frontend (localhost or production domain) to connect
 	corsHandler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -319,11 +335,11 @@ func (s *AppServer) handleChat(w http.ResponseWriter, r *http.Request, claims *C
 		}
 	}
 
-	// 4. Call Modal GPU Function
-	ctx, cancel := context.WithTimeout(r.Context(), 60*time.Second)
+	// 4. Call Modal GPU Function (120s timeout to allow for container cold start + token generation)
+	ctx, cancel := context.WithTimeout(r.Context(), 120*time.Second)
 	defer cancel()
 
-	res, err := s.modalFunction.Remote(ctx, []any{payload}, nil)
+	res, err := s.modalGenerate.Remote(ctx, []any{payload}, nil)
 	if err != nil {
 		log.Printf("Modal invocation error: %v", err)
 		writeJSON(w, http.StatusBadGateway, map[string]string{"error": "Model inference failed. Please try again."})
@@ -335,6 +351,11 @@ func (s *AppServer) handleChat(w http.ResponseWriter, r *http.Request, claims *C
 		reply = fmt.Sprintf("%v", res)
 	}
 
+	// Record activity to track warm container status (5-minute idle window)
+	s.lastActivityMu.Lock()
+	s.lastActivity = time.Now()
+	s.lastActivityMu.Unlock()
+
 	// 5. Save user message and AI reply into SQLite
 	_ = SaveMessage(s.db, claims.UserID, "user", fmt.Sprintf("Friend: %s", prompt))
 	_ = SaveMessage(s.db, claims.UserID, "assistant", reply)
@@ -342,6 +363,60 @@ func (s *AppServer) handleChat(w http.ResponseWriter, r *http.Request, claims *C
 	writeJSON(w, http.StatusOK, ChatResponse{
 		Reply:     reply,
 		CreatedAt: time.Now().UTC(),
+	})
+}
+
+const idleWindow = 300 * time.Second // Matches Modal's scaledown_window (5 minutes)
+
+func (s *AppServer) handleGpuStatus(w http.ResponseWriter, r *http.Request, claims *Claims) {
+	s.lastActivityMu.RLock()
+	last := s.lastActivity
+	s.lastActivityMu.RUnlock()
+
+	isWarm := false
+	secondsRemaining := 0
+	if !last.IsZero() {
+		elapsed := time.Since(last)
+		if elapsed < idleWindow {
+			isWarm = true
+			secondsRemaining = int((idleWindow - elapsed).Seconds())
+		}
+	}
+
+	writeJSON(w, http.StatusOK, map[string]any{
+		"warm":              isWarm,
+		"seconds_remaining": secondsRemaining,
+	})
+}
+
+func (s *AppServer) handleWarmup(w http.ResponseWriter, r *http.Request, claims *Claims) {
+	ctx, cancel := context.WithTimeout(r.Context(), 120*time.Second)
+	defer cancel()
+
+	var err error
+	if s.modalWarmup != nil {
+		_, err = s.modalWarmup.Remote(ctx, []any{}, nil)
+	} else {
+		// Fallback to generate method if warmup method is not yet deployed on Modal
+		pingPayload := []any{
+			map[string]any{"role": "user", "content": "ping"},
+		}
+		_, err = s.modalGenerate.Remote(ctx, []any{pingPayload}, nil)
+	}
+
+	if err != nil {
+		log.Printf("Warmup failed: %v", err)
+		writeJSON(w, http.StatusBadGateway, map[string]string{"error": "Failed to warm up GPU container. Please try again."})
+		return
+	}
+
+	s.lastActivityMu.Lock()
+	s.lastActivity = time.Now()
+	s.lastActivityMu.Unlock()
+
+	writeJSON(w, http.StatusOK, map[string]any{
+		"status":            "ready",
+		"seconds_remaining": int(idleWindow.Seconds()),
 	})
 }
 

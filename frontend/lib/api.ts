@@ -69,6 +69,16 @@ class ApiService {
     })
   }
 
+  getGpuStatus() {
+    return this.request<{ warm: boolean; seconds_remaining: number }>("/api/chat/status")
+  }
+
+  warmup() {
+    return this.request<{ status: string; seconds_remaining: number }>("/api/chat/warmup", {
+      method: "POST",
+    })
+  }
+
   logout() {
     localStorage.removeItem("auth_token")
     localStorage.removeItem("auth_user")

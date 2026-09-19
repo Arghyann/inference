@@ -25,7 +25,7 @@ image = (
     image=image,
     gpu="T4",                     # Lowest billing rate ($0.000164/sec)
     volumes={"/data": volume},
-    scaledown_window=60,          # Shut down after 60s idle
+    scaledown_window=300,         # Shut down after 5m idle (prevents rapid cold starts)
     max_containers=1,             # Cap at 1 GPU; all users share the same warm container
 )
 class ChatModel:
@@ -43,6 +43,11 @@ class ChatModel:
             load_in_4bit=True,
         )
         FastLanguageModel.for_inference(self.model)
+
+    @modal.method()
+    def warmup(self) -> str:
+        """Lightweight ping to wake container and execute @modal.enter() without token generation."""
+        return "ready"
 
     @modal.method()
     def generate(self, history: list) -> str:
