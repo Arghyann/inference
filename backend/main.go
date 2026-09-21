@@ -542,14 +542,18 @@ func (s *AppServer) handleChat(w http.ResponseWriter, r *http.Request, claims *C
 	// 2. Format history for model prompt
 	payload := make([]any, len(convMessages)+1)
 	for i, m := range convMessages {
+		content := m.Content
+		if m.Role == "user" {
+			content = strings.TrimPrefix(content, "Friend: ")
+		}
 		payload[i] = map[string]any{
 			"role":    m.Role,
-			"content": m.Content,
+			"content": content,
 		}
 	}
 	payload[len(convMessages)] = map[string]any{
 		"role":    "user",
-		"content": fmt.Sprintf("Friend: %s", prompt),
+		"content": prompt,
 	}
 
 	// 3. Call Modal GPU Function (120s timeout to allow for container cold start + token generation)
@@ -591,7 +595,7 @@ func (s *AppServer) handleChat(w http.ResponseWriter, r *http.Request, claims *C
 	s.lastActivityMu.Unlock()
 
 	// 4. Save user message and AI reply into SQLite under this conversation
-	_ = SaveConversationMessage(s.db, conversationID, claims.UserID, "user", fmt.Sprintf("Friend: %s", prompt), modelChoice)
+	_ = SaveConversationMessage(s.db, conversationID, claims.UserID, "user", prompt, modelChoice)
 	_ = SaveConversationMessage(s.db, conversationID, claims.UserID, "assistant", reply, modelChoice)
 
 	// 5. Increment prompt usage counter for user

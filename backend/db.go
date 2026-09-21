@@ -109,6 +109,7 @@ func InitDB(dbPath string) (*sql.DB, error) {
 	_, _ = db.Exec("ALTER TABLE users ADD COLUMN prompt_limit INTEGER DEFAULT 50;")
 	_, _ = db.Exec("ALTER TABLE users ADD COLUMN prompts_used INTEGER DEFAULT 0;")
 	_, _ = db.Exec("ALTER TABLE invite_codes ADD COLUMN prompt_limit INTEGER DEFAULT 50;")
+	_, _ = db.Exec("UPDATE messages SET content = SUBSTR(content, 9) WHERE content LIKE 'Friend: %';")
 
 	return db, nil
 }

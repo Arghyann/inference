@@ -127,4 +127,16 @@ class ChatModel:
             )
 
         response_tokens = outputs[0][len(inputs[0]):]
-        return self.tokenizer.decode(response_tokens, skip_special_tokens=True).strip()
+        reply = self.tokenizer.decode(response_tokens, skip_special_tokens=True).strip()
+
+        # Remove any accidental leading speaker labels
+        for prefix in ["Aryan:", "Aryan AI:", "assistant:"]:
+            if reply.startswith(prefix):
+                reply = reply[len(prefix):].strip()
+
+        # Stop sequence protection: cut off if model hallucinated another conversational turn
+        for stop_marker in ["\nFriend:", "\nUser:", "\nHuman:", "\nAryan:", "\nassistant:", "\n<|im_end|>", "\n<|im_start|>"]:
+            if stop_marker in reply:
+                reply = reply.split(stop_marker)[0].strip()
+
+        return reply
