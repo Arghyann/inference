@@ -28,9 +28,10 @@ SYSTEM_PROMPT = (
 
 @app.cls(
     image=image,
-    gpu="T4",                     # Cost-effective T4 GPU ($0.000164/sec)
+    gpu="L4",                     # Matches finetune config: 24GB VRAM & fast inference
     volumes={"/data": volume},
-    scaledown_window=120,         # Idle container lives for 2m to minimize GPU cost
+    scaledown_window=300,         # Keep container warm for 5 minutes (matches chat.py)
+    timeout=180,
     max_containers=1,             # Cap at 1 GPU shared across backend clients
 )
 class ChatModel:

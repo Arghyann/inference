@@ -532,8 +532,8 @@ func (s *AppServer) handleChat(w http.ResponseWriter, r *http.Request, claims *C
 		}
 	}
 
-	// 1. Fetch conversation's previous 25 messages from SQLite for rich context
-	convMessages, err := GetConversationMessages(s.db, conversationID, claims.UserID, 25)
+	// 1. Fetch conversation's previous 12 messages from SQLite for context (matches chat.py)
+	convMessages, err := GetConversationMessages(s.db, conversationID, claims.UserID, 12)
 	if err != nil {
 		log.Printf("Error fetching conversation messages: %v", err)
 		convMessages = []Message{}
@@ -556,8 +556,8 @@ func (s *AppServer) handleChat(w http.ResponseWriter, r *http.Request, claims *C
 		"content": prompt,
 	}
 
-	// 3. Call Modal GPU Function (120s timeout to allow for container cold start + token generation)
-	ctx, cancel := context.WithTimeout(r.Context(), 120*time.Second)
+	// 3. Call Modal GPU Function (180s timeout matching Modal config)
+	ctx, cancel := context.WithTimeout(r.Context(), 180*time.Second)
 	defer cancel()
 
 	botInst, err := s.getBotInstance(ctx, modelChoice)
@@ -574,8 +574,16 @@ func (s *AppServer) handleChat(w http.ResponseWriter, r *http.Request, claims *C
 		return
 	}
 
+	// Exact generation parameters matching finetune/chat.py
+	temp := 0.7
+	if strings.Contains(modelChoice, "comedy") || strings.Contains(modelChoice, "funny") {
+		temp = 0.8
+	}
+
 	res, err := generateMethod.Remote(ctx, []any{payload}, map[string]any{
 		"model":          modelChoice,
+		"temperature":    temp,
+		"top_p":          0.9,
 		"max_new_tokens": 256,
 	})
 	if err != nil {
