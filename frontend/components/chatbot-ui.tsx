@@ -15,28 +15,28 @@ export const MODEL_OPTIONS: {
 }[] = [
   {
     id: "qwen-6k",
-    label: "Qwen 2.5 14B — Balanced 6k",
-    short: "Qwen 14B",
+    label: "Qwen 6k",
+    short: "Qwen 6k",
     badgeColor: "text-lime-400",
     description: "Best all-around Aryan texting persona",
   },
   {
     id: "qwen-comedy",
-    label: "Qwen 2.5 14B — Comedy & Banter",
-    short: "Comedy 14B",
+    label: "Qwen Funny",
+    short: "Qwen Funny",
     badgeColor: "text-emerald-400",
     description: "Punchy jokes, laugh reactions & sharp banter",
   },
   {
     id: "llama-v3",
-    label: "Llama 3.1 8B — Balanced v3",
+    label: "Llama v3",
     short: "Llama v3",
     badgeColor: "text-cyan-400",
     description: "Previous Llama 3.1 8B balanced model",
   },
   {
     id: "llama-v2",
-    label: "Llama 3 8B — Baseline v2",
+    label: "Llama v2",
     short: "Llama v2",
     badgeColor: "text-amber-300",
     description: "Initial 8B baseline fine-tune",
@@ -46,7 +46,7 @@ export const MODEL_OPTIONS: {
 export function getModelBadge(modelTag?: string) {
   switch (modelTag) {
     case "qwen-comedy":
-      return { label: "Comedy 14B", color: "text-emerald-400" }
+      return { label: "Qwen Funny", color: "text-emerald-400" }
     case "llama-v3":
     case "v3":
       return { label: "Llama v3", color: "text-cyan-400" }
@@ -56,7 +56,7 @@ export function getModelBadge(modelTag?: string) {
       return { label: "Llama v2", color: "text-amber-300" }
     case "qwen-6k":
     default:
-      return { label: "Qwen 14B", color: "text-lime-400" }
+      return { label: "Qwen 6k", color: "text-lime-400" }
   }
 }
 
