@@ -34,44 +34,60 @@ SYSTEM_PROMPT = (
     max_containers=1,             # Cap at 1 GPU shared across backend clients
 )
 class ChatModel:
+    model_tag: str = modal.parameter(default="qwen-6k")
+
     @modal.enter()
     def load_model(self):
         from unsloth import FastLanguageModel
 
-        # Base model with v2 adapter as default
-        checkpoint_v2 = "/data/aryan-llama-lora-v2"
-        checkpoint_v1 = "/data/aryan-"
-        print(f"Loading base model + v2 adapter from {checkpoint_v2}...")
+        MODEL_PATHS = {
+            "qwen-6k": "/data/aryan-qwen14b-6k-lora",
+            "qwen-comedy": "/data/aryan-qwen14b-comedy-lora",
+            "llama-v3": "/data/aryan-llama-lora-v3",
+            "llama-v2": "/data/aryan-llama-lora-v2",
+        }
+
+        # Normalize tag and handle legacy aliases
+        tag = (self.model_tag or "qwen-6k").lower().strip()
+        if tag in ["v3", "llama-3"]:
+            tag = "llama-v3"
+        elif tag in ["v2", "v1", "llama-2"]:
+            tag = "llama-v2"
+        elif tag not in MODEL_PATHS:
+            tag = "qwen-6k"
+
+        checkpoint_path = MODEL_PATHS[tag]
+        print(f"Loading model '{tag}' from {checkpoint_path}...")
 
         self.model, self.tokenizer = FastLanguageModel.from_pretrained(
-            model_name=checkpoint_v2,
+            model_name=checkpoint_path,
             max_seq_length=2048,
             dtype=None,
             load_in_4bit=True,
         )
 
-        print(f"Loading v1 adapter from {checkpoint_v1}...")
-        self.model.load_adapter(checkpoint_v1, adapter_name="v1")
-
         FastLanguageModel.for_inference(self.model)
-        print("Both v1 and v2 adapters loaded into single GPU VRAM and ready!")
+        print(f"Model '{tag}' loaded into GPU VRAM and ready!")
 
     @modal.method()
     def warmup(self) -> str:
         """Lightweight ping to wake container and execute @modal.enter() without token generation."""
-        return "ready"
+        return f"{self.model_tag} ready"
 
     @modal.method()
-    def generate(self, history: list, model: str = "v2") -> str:
+    def generate(
+        self,
+        history: list,
+        model: str = "",
+        temperature: float = 0.7,
+        top_p: float = 0.9,
+        max_new_tokens: int = 256,
+    ) -> str:
         import torch
 
-        # Switch active adapter instantly (<1ms) on the same GPU
-        target_adapter = "v1" if model == "v1" else "default"
-        try:
-            self.model.set_adapter(target_adapter)
-        except Exception as e:
-            print(f"Error setting adapter to {target_adapter}, falling back to default: {e}")
-            self.model.set_adapter("default")
+        # Default comedy temperature to 0.8 if standard 0.7 was passed
+        if self.model_tag == "qwen-comedy" and temperature == 0.7:
+            temperature = 0.8
 
         # Inject system prompt at the beginning of conversational history
         messages = [{"role": "system", "content": SYSTEM_PROMPT}] + history
@@ -86,10 +102,10 @@ class ChatModel:
         with torch.inference_mode():
             outputs = self.model.generate(
                 input_ids=inputs,
-                max_new_tokens=128,       # Optimized for punchy chat replies
+                max_new_tokens=max_new_tokens,
                 use_cache=True,
-                temperature=0.7,
-                top_p=0.9,
+                temperature=temperature,
+                top_p=top_p,
                 pad_token_id=self.tokenizer.eos_token_id,
             )
 

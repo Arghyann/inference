@@ -13,11 +13,13 @@ import (
 )
 
 type User struct {
-	ID           int64
-	Username     string
-	PasswordHash string
-	IsAdmin      bool
-	IsApproved   bool
+	ID           int64  `json:"id"`
+	Username     string `json:"username"`
+	PasswordHash string `json:"-"`
+	IsAdmin      bool   `json:"is_admin"`
+	IsApproved   bool   `json:"is_approved"`
+	PromptLimit  int    `json:"prompt_limit"`
+	PromptsUsed  int    `json:"prompts_used"`
 }
 
 type Conversation struct {
@@ -56,12 +58,15 @@ func InitDB(dbPath string) (*sql.DB, error) {
 		password_hash TEXT NOT NULL,
 		is_admin BOOLEAN DEFAULT 0,
 		is_approved BOOLEAN DEFAULT 0,
+		prompt_limit INTEGER DEFAULT 50,
+		prompts_used INTEGER DEFAULT 0,
 		created_at DATETIME DEFAULT CURRENT_TIMESTAMP
 	);
 
 	CREATE TABLE IF NOT EXISTS invite_codes (
 		id INTEGER PRIMARY KEY AUTOINCREMENT,
 		code TEXT NOT NULL UNIQUE,
+		prompt_limit INTEGER DEFAULT 50,
 		is_used BOOLEAN DEFAULT 0,
 		used_by_username TEXT,
 		created_at DATETIME DEFAULT CURRENT_TIMESTAMP
@@ -84,7 +89,7 @@ func InitDB(dbPath string) (*sql.DB, error) {
 		user_id INTEGER NOT NULL,
 		role TEXT NOT NULL,
 		content TEXT NOT NULL,
-		model TEXT DEFAULT 'v2',
+		model TEXT DEFAULT 'qwen-6k',
 		created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
 		FOREIGN KEY(user_id) REFERENCES users(id) ON DELETE CASCADE,
 		FOREIGN KEY(conversation_id) REFERENCES conversations(id) ON DELETE CASCADE
@@ -97,20 +102,27 @@ func InitDB(dbPath string) (*sql.DB, error) {
 		return nil, fmt.Errorf("failed to initialize db schema: %w", err)
 	}
 
-	// Safe migration: Add conversation_id column to messages table if table already existed
+	// Safe migrations
 	_, _ = db.Exec("ALTER TABLE messages ADD COLUMN conversation_id TEXT;")
 	_, _ = db.Exec("CREATE INDEX IF NOT EXISTS idx_messages_conv_id ON messages(conversation_id, created_at);")
-	_, _ = db.Exec("ALTER TABLE messages ADD COLUMN model TEXT DEFAULT 'v2';")
+	_, _ = db.Exec("ALTER TABLE messages ADD COLUMN model TEXT DEFAULT 'qwen-6k';")
+	_, _ = db.Exec("ALTER TABLE users ADD COLUMN prompt_limit INTEGER DEFAULT 50;")
+	_, _ = db.Exec("ALTER TABLE users ADD COLUMN prompts_used INTEGER DEFAULT 0;")
+	_, _ = db.Exec("ALTER TABLE invite_codes ADD COLUMN prompt_limit INTEGER DEFAULT 50;")
 
 	return db, nil
 }
 
 // CreateUser creates a new user in the database
-func CreateUser(db *sql.DB, username, passwordHash string, isAdmin, isApproved bool) (int64, error) {
+func CreateUser(db *sql.DB, username, passwordHash string, isAdmin, isApproved bool, promptLimit ...int) (int64, error) {
 	username = strings.ToLower(strings.TrimSpace(username))
+	limit := 50
+	if len(promptLimit) > 0 {
+		limit = promptLimit[0]
+	}
 	res, err := db.Exec(
-		"INSERT INTO users (username, password_hash, is_admin, is_approved) VALUES (?, ?, ?, ?)",
-		username, passwordHash, isAdmin, isApproved,
+		"INSERT INTO users (username, password_hash, is_admin, is_approved, prompt_limit, prompts_used) VALUES (?, ?, ?, ?, ?, 0)",
+		username, passwordHash, isAdmin, isApproved, limit,
 	)
 	if err != nil {
 		return 0, err
@@ -122,8 +134,19 @@ func CreateUser(db *sql.DB, username, passwordHash string, isAdmin, isApproved b
 func GetUserByUsername(db *sql.DB, username string) (*User, error) {
 	username = strings.ToLower(strings.TrimSpace(username))
 	u := &User{}
-	row := db.QueryRow("SELECT id, username, password_hash, is_admin, is_approved FROM users WHERE username = ?", username)
-	err := row.Scan(&u.ID, &u.Username, &u.PasswordHash, &u.IsAdmin, &u.IsApproved)
+	row := db.QueryRow("SELECT id, username, password_hash, is_admin, is_approved, COALESCE(prompt_limit, 50), COALESCE(prompts_used, 0) FROM users WHERE username = ?", username)
+	err := row.Scan(&u.ID, &u.Username, &u.PasswordHash, &u.IsAdmin, &u.IsApproved, &u.PromptLimit, &u.PromptsUsed)
+	if err != nil {
+		return nil, err
+	}
+	return u, nil
+}
+
+// GetUserByID fetches a user record by primary key ID
+func GetUserByID(db *sql.DB, userID int64) (*User, error) {
+	u := &User{}
+	row := db.QueryRow("SELECT id, username, password_hash, is_admin, is_approved, COALESCE(prompt_limit, 50), COALESCE(prompts_used, 0) FROM users WHERE id = ?", userID)
+	err := row.Scan(&u.ID, &u.Username, &u.PasswordHash, &u.IsAdmin, &u.IsApproved, &u.PromptLimit, &u.PromptsUsed)
 	if err != nil {
 		return nil, err
 	}
@@ -147,15 +170,19 @@ func ApproveUser(db *sql.DB, username string) error {
 	return nil
 }
 
-// GenerateInviteCode creates a new 8-character random invite code
-func GenerateInviteCode(db *sql.DB) (string, error) {
+// GenerateInviteCode creates a new 8-character random invite code with an optional prompt limit
+func GenerateInviteCode(db *sql.DB, promptLimit ...int) (string, error) {
 	bytes := make([]byte, 4)
 	if _, err := rand.Read(bytes); err != nil {
 		return "", err
 	}
 	code := "INV-" + strings.ToUpper(hex.EncodeToString(bytes))
+	limit := 50
+	if len(promptLimit) > 0 {
+		limit = promptLimit[0]
+	}
 
-	_, err := db.Exec("INSERT INTO invite_codes (code) VALUES (?)", code)
+	_, err := db.Exec("INSERT INTO invite_codes (code, prompt_limit) VALUES (?, ?)", code, limit)
 	if err != nil {
 		return "", err
 	}
@@ -207,7 +234,20 @@ func RegisterUserWithInvite(db *sql.DB, username, passwordHash, inviteCode strin
 	}
 	defer tx.Rollback()
 
-	// Atomically burn the invite code
+	// Atomically burn the invite code and fetch its configured prompt limit
+	var isUsed bool
+	var promptLimit int
+	err = tx.QueryRow("SELECT is_used, COALESCE(prompt_limit, 50) FROM invite_codes WHERE code = ?", inviteCode).Scan(&isUsed, &promptLimit)
+	if err == sql.ErrNoRows {
+		return 0, fmt.Errorf("invalid invite code")
+	}
+	if err != nil {
+		return 0, fmt.Errorf("database error: %w", err)
+	}
+	if isUsed {
+		return 0, fmt.Errorf("invite code has already been used")
+	}
+
 	res, err := tx.Exec(
 		"UPDATE invite_codes SET is_used = 1, used_by_username = ? WHERE code = ? AND is_used = 0",
 		username, inviteCode,
@@ -217,25 +257,14 @@ func RegisterUserWithInvite(db *sql.DB, username, passwordHash, inviteCode strin
 	}
 
 	rows, err := res.RowsAffected()
-	if err != nil {
-		return 0, fmt.Errorf("database error: %w", err)
-	}
-	if rows == 0 {
-		var isUsed bool
-		err := tx.QueryRow("SELECT is_used FROM invite_codes WHERE code = ?", inviteCode).Scan(&isUsed)
-		if err == sql.ErrNoRows {
-			return 0, fmt.Errorf("invalid invite code")
-		}
-		if isUsed {
-			return 0, fmt.Errorf("invite code has already been used")
-		}
+	if err != nil || rows == 0 {
 		return 0, fmt.Errorf("failed to use invite code")
 	}
 
-	// Create user
+	// Create user inheriting the invite code's prompt quota
 	userRes, err := tx.Exec(
-		"INSERT INTO users (username, password_hash, is_admin, is_approved) VALUES (?, ?, ?, ?)",
-		username, passwordHash, false, true,
+		"INSERT INTO users (username, password_hash, is_admin, is_approved, prompt_limit, prompts_used) VALUES (?, ?, ?, ?, ?, 0)",
+		username, passwordHash, false, true, promptLimit,
 	)
 	if err != nil {
 		return 0, err
@@ -246,6 +275,29 @@ func RegisterUserWithInvite(db *sql.DB, username, passwordHash, inviteCode strin
 	}
 
 	return userRes.LastInsertId()
+}
+
+// IncrementPromptsUsed adds 1 to the user's prompt usage counter
+func IncrementPromptsUsed(db *sql.DB, userID int64) error {
+	_, err := db.Exec("UPDATE users SET prompts_used = prompts_used + 1 WHERE id = ?", userID)
+	return err
+}
+
+// SetUserPromptLimit updates the message quota for an existing user
+func SetUserPromptLimit(db *sql.DB, username string, limit int) error {
+	username = strings.ToLower(strings.TrimSpace(username))
+	res, err := db.Exec("UPDATE users SET prompt_limit = ? WHERE username = ?", limit, username)
+	if err != nil {
+		return err
+	}
+	rows, err := res.RowsAffected()
+	if err != nil {
+		return err
+	}
+	if rows == 0 {
+		return fmt.Errorf("user '%s' not found", username)
+	}
+	return nil
 }
 
 // SaveMessage stores a message in history
@@ -358,7 +410,7 @@ func GetConversationMessages(db *sql.DB, conversationID string, userID int64, li
 		limit = 50
 	}
 	query := `
-	SELECT id, role, content, COALESCE(model, 'v2'), created_at FROM (
+	SELECT id, role, content, COALESCE(model, 'qwen-6k'), created_at FROM (
 		SELECT id, role, content, model, created_at 
 		FROM messages 
 		WHERE conversation_id = ? AND user_id = ? 
@@ -387,7 +439,7 @@ func GetConversationMessages(db *sql.DB, conversationID string, userID int64, li
 // SaveConversationMessage stores a message in a specific conversation and updates its timestamp
 func SaveConversationMessage(db *sql.DB, conversationID string, userID int64, role, content string, model ...string) error {
 	now := time.Now().UTC()
-	msgModel := "v2"
+	msgModel := "qwen-6k"
 	if len(model) > 0 && model[0] != "" {
 		msgModel = model[0]
 	}

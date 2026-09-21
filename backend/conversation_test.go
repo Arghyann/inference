@@ -98,3 +98,83 @@ func TestConversation_DatabaseOperations(t *testing.T) {
 		t.Fatalf("Expected 0 messages after delete, got %d", len(msgsAfter))
 	}
 }
+
+func TestNormalizeModel(t *testing.T) {
+	tests := []struct {
+		input    string
+		expected string
+	}{
+		{"qwen-6k", "qwen-6k"},
+		{"qwen-comedy", "qwen-comedy"},
+		{"llama-v3", "llama-v3"},
+		{"llama-v2", "llama-v2"},
+		{"v3", "llama-v3"},
+		{"llama-3", "llama-v3"},
+		{"v2", "llama-v2"},
+		{"v1", "llama-v2"},
+		{"", "qwen-6k"},
+		{"unknown", "qwen-6k"},
+	}
+
+	for _, tt := range tests {
+		got := normalizeModel(tt.input)
+		if got != tt.expected {
+			t.Errorf("normalizeModel(%q) = %q; want %q", tt.input, got, tt.expected)
+		}
+	}
+}
+
+func TestConversation_ModelPersistence(t *testing.T) {
+	tempDir := t.TempDir()
+	dbPath := filepath.Join(tempDir, "test_models.db")
+
+	db, err := InitDB(dbPath)
+	if err != nil {
+		t.Fatalf("InitDB failed: %v", err)
+	}
+	defer db.Close()
+
+	userID, err := CreateUser(db, "modeluser", "hashedpass", false, true)
+	if err != nil {
+		t.Fatalf("CreateUser failed: %v", err)
+	}
+
+	conv, err := CreateConversation(db, "", "Model Test", userID)
+	if err != nil {
+		t.Fatalf("CreateConversation failed: %v", err)
+	}
+
+	// Save turn with qwen-6k
+	err = SaveConversationMessage(db, conv.ID, userID, "user", "Friend: Hi", "qwen-6k")
+	if err != nil {
+		t.Fatalf("Failed to save user message: %v", err)
+	}
+	err = SaveConversationMessage(db, conv.ID, userID, "assistant", "Hello", "qwen-6k")
+	if err != nil {
+		t.Fatalf("Failed to save assistant message: %v", err)
+	}
+
+	// Switch model mid-way to qwen-comedy
+	err = SaveConversationMessage(db, conv.ID, userID, "user", "Friend: Make me laugh", "qwen-comedy")
+	if err != nil {
+		t.Fatalf("Failed to save user message: %v", err)
+	}
+	err = SaveConversationMessage(db, conv.ID, userID, "assistant", "Why so serious?", "qwen-comedy")
+	if err != nil {
+		t.Fatalf("Failed to save comedy message: %v", err)
+	}
+
+	msgs, err := GetConversationMessages(db, conv.ID, userID, 10)
+	if err != nil {
+		t.Fatalf("Failed to get messages: %v", err)
+	}
+	if len(msgs) != 4 {
+		t.Fatalf("Expected 4 messages, got %d", len(msgs))
+	}
+	if msgs[1].Model != "qwen-6k" {
+		t.Errorf("Expected first reply model 'qwen-6k', got %q", msgs[1].Model)
+	}
+	if msgs[3].Model != "qwen-comedy" {
+		t.Errorf("Expected second reply model 'qwen-comedy', got %q", msgs[3].Model)
+	}
+}

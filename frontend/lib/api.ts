@@ -1,5 +1,7 @@
 const BASE_URL = process.env.NEXT_PUBLIC_API_URL || "https://aryanssh.duckdns.org"
 
+export type ModelTag = "qwen-6k" | "qwen-comedy" | "llama-v3" | "llama-v2"
+
 export type ChatMessage = {
   id?: number
   conversation_id?: string
@@ -55,13 +57,17 @@ class ApiService {
   }
 
   async login(payload: { username: string; password: string }) {
-    const data = await this.request<{ token: string; username: string }>("/api/auth/login", {
+    const data = await this.request<{ token: string; username: string; prompt_limit?: number; prompts_used?: number }>("/api/auth/login", {
       method: "POST",
       body: JSON.stringify(payload),
     })
     localStorage.setItem("auth_token", data.token)
     localStorage.setItem("auth_user", data.username)
     return data
+  }
+
+  async getUserMe() {
+    return this.request<{ username: string; prompt_limit: number; prompts_used: number }>("/api/user/me")
   }
 
   async getConversations() {
@@ -98,8 +104,15 @@ class ApiService {
     }))
   }
 
-  sendMessage(message: string, conversationId?: string, model: "v1" | "v2" = "v2") {
-    return this.request<{ reply: string; created_at: string; conversation_id: string; model: string }>("/api/chat", {
+  sendMessage(message: string, conversationId?: string, model: ModelTag = "qwen-6k") {
+    return this.request<{
+      reply: string
+      created_at: string
+      conversation_id: string
+      model: string
+      prompts_used?: number
+      prompt_limit?: number
+    }>("/api/chat", {
       method: "POST",
       body: JSON.stringify({ message, conversation_id: conversationId, model }),
     })
@@ -109,8 +122,8 @@ class ApiService {
     return this.request<{ warm: boolean; seconds_remaining: number }>("/api/chat/status")
   }
 
-  warmup() {
-    return this.request<{ status: string; seconds_remaining: number }>("/api/chat/warmup", {
+  warmup(model: ModelTag = "qwen-6k") {
+    return this.request<{ status: string; seconds_remaining: number }>(`/api/chat/warmup?model=${encodeURIComponent(model)}`, {
       method: "POST",
     })
   }

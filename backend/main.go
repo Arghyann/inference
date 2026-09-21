@@ -29,8 +29,9 @@ type Config struct {
 
 type AppServer struct {
 	db             *sql.DB
-	modalGenerate  *modal.Function
-	modalWarmup    *modal.Function
+	modalCls       *modal.Cls
+	instancesMu    sync.RWMutex
+	instances      map[string]*modal.ClsInstance
 	jwtSecret      []byte
 	lastActivityMu sync.RWMutex
 	lastActivity   time.Time
@@ -43,7 +44,9 @@ func main() {
 	// 1. Parse Command Line Flags (SSH Admin Only)
 	createInviteFlag := flag.Bool("create-invite", false, "Generate an invite code from CLI (SSH)")
 	createUserFlag := flag.Bool("create-user", false, "Directly create a user from CLI (SSH)")
-	usernameFlag := flag.String("u", "", "Username for user creation")
+	setLimitFlag := flag.Bool("set-limit", false, "Set prompt limit for an existing user (SSH)")
+	limitFlag := flag.Int("limit", 50, "Message limit for invite code or user (0 for unlimited)")
+	usernameFlag := flag.String("u", "", "Username for user operations")
 	passwordFlag := flag.String("p", "", "Password for user creation (optional; will prompt securely if omitted)")
 	flag.Parse()
 
@@ -69,18 +72,39 @@ func main() {
 
 	// SSH ADMIN COMMAND: Generate Invite Code
 	if *createInviteFlag {
-		code, err := GenerateInviteCode(db)
+		code, err := GenerateInviteCode(db, *limitFlag)
 		if err != nil {
 			log.Fatalf("Failed to generate invite code: %v", err)
 		}
-		fmt.Printf("\nGenerated One-Time Invite Code: %s\nSend this to your friend. They can use it to register.\n\n", code)
+		quotaDesc := fmt.Sprintf("%d messages", *limitFlag)
+		if *limitFlag <= 0 {
+			quotaDesc = "Unlimited messages"
+		}
+		fmt.Printf("\nGenerated One-Time Invite Code: %s (Quota: %s)\nSend this to your friend. They can use it to register.\n\n", code, quotaDesc)
+		return
+	}
+
+	// SSH ADMIN COMMAND: Update Prompt Limit for Existing User
+	if *setLimitFlag {
+		if *usernameFlag == "" {
+			log.Fatal("Usage: ./server-bin -set-limit -u <username> -limit <number>")
+		}
+		cleanUser := strings.ToLower(strings.TrimSpace(*usernameFlag))
+		if err := SetUserPromptLimit(db, cleanUser, *limitFlag); err != nil {
+			log.Fatalf("Failed to update limit: %v", err)
+		}
+		quotaDesc := fmt.Sprintf("%d messages", *limitFlag)
+		if *limitFlag <= 0 {
+			quotaDesc = "Unlimited messages"
+		}
+		fmt.Printf("Successfully updated quota for user '%s' to %s\n", cleanUser, quotaDesc)
 		return
 	}
 
 	// SSH ADMIN COMMAND: Directly Create a User
 	if *createUserFlag {
 		if *usernameFlag == "" {
-			log.Fatal("Usage: ./server-bin -create-user -u <username> [-p <password>]")
+			log.Fatal("Usage: ./server-bin -create-user -u <username> [-p <password>] [-limit <n>]")
 		}
 		cleanUser := strings.ToLower(strings.TrimSpace(*usernameFlag))
 		if !isValidUsername(cleanUser) {
@@ -105,11 +129,15 @@ func main() {
 		if err != nil {
 			log.Fatalf("Error hashing password: %v", err)
 		}
-		id, err := CreateUser(db, cleanUser, hash, false, true)
+		id, err := CreateUser(db, cleanUser, hash, false, true, *limitFlag)
 		if err != nil {
 			log.Fatalf("Failed to create user: %v", err)
 		}
-		fmt.Printf("Successfully created user '%s' (ID: %d)\n", cleanUser, id)
+		quotaDesc := fmt.Sprintf("%d messages", *limitFlag)
+		if *limitFlag <= 0 {
+			quotaDesc = "Unlimited messages"
+		}
+		fmt.Printf("Successfully created user '%s' (ID: %d, Quota: %s)\n", cleanUser, id, quotaDesc)
 		return
 	}
 
@@ -126,27 +154,13 @@ func main() {
 		log.Fatalf("Failed to lookup ChatModel on Modal: %v", err)
 	}
 
-	instance, err := cls.Instance(ctx, nil)
-	if err != nil {
-		log.Fatalf("Failed to instantiate ChatModel: %v", err)
-	}
-
-	generateMethod, err := instance.Method("generate")
-	if err != nil {
-		log.Fatalf("Failed to find generate method: %v", err)
-	}
 	fmt.Println("Connected to Modal ChatModel successfully!")
 
-	warmupMethod, err := instance.Method("warmup")
-	if err != nil {
-		log.Printf("Warmup method not found on Modal (will fallback to generate on first use): %v", err)
-	}
-
 	server := &AppServer{
-		db:            db,
-		modalGenerate: generateMethod,
-		modalWarmup:   warmupMethod,
-		jwtSecret:     []byte(cfg.JWTSecret),
+		db:        db,
+		modalCls:  cls,
+		instances: make(map[string]*modal.ClsInstance),
+		jwtSecret: []byte(cfg.JWTSecret),
 	}
 
 	// 4. Register HTTP Routes (NO ADMIN ROUTES EXPOSED OVER HTTP)
@@ -171,6 +185,7 @@ func main() {
 	mux.HandleFunc("GET /api/chat/history", server.requireAuth(server.handleChatHistory))
 	mux.HandleFunc("GET /api/chat/status", server.requireAuth(server.handleGpuStatus))
 	mux.HandleFunc("POST /api/chat/warmup", RateLimitMiddleware(warmupLimiter, server.requireAuth(server.handleWarmup)))
+	mux.HandleFunc("GET /api/user/me", server.requireAuth(server.handleGetMe))
 
 	// Security headers & CORS handler
 	corsHandler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -375,8 +390,23 @@ func (s *AppServer) handleLogin(w http.ResponseWriter, r *http.Request) {
 	}
 
 	writeJSON(w, http.StatusOK, map[string]any{
-		"token":    token,
-		"username": user.Username,
+		"token":        token,
+		"username":     user.Username,
+		"prompt_limit": user.PromptLimit,
+		"prompts_used": user.PromptsUsed,
+	})
+}
+
+func (s *AppServer) handleGetMe(w http.ResponseWriter, r *http.Request, claims *Claims) {
+	user, err := GetUserByID(s.db, claims.UserID)
+	if err != nil || user == nil {
+		writeJSON(w, http.StatusNotFound, map[string]string{"error": "User not found"})
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"username":     user.Username,
+		"prompt_limit": user.PromptLimit,
+		"prompts_used": user.PromptsUsed,
 	})
 }
 
@@ -391,6 +421,45 @@ type ChatResponse struct {
 	CreatedAt      time.Time `json:"created_at"`
 	ConversationID string    `json:"conversation_id"`
 	Model          string    `json:"model"`
+	PromptsUsed    int       `json:"prompts_used"`
+	PromptLimit    int       `json:"prompt_limit"`
+}
+
+func normalizeModel(tag string) string {
+	clean := strings.ToLower(strings.TrimSpace(tag))
+	switch clean {
+	case "qwen-6k", "qwen-comedy", "llama-v3", "llama-v2":
+		return clean
+	case "v3", "llama-3", "llama3":
+		return "llama-v3"
+	case "v2", "v1", "llama-2", "llama2", "llama":
+		return "llama-v2"
+	default:
+		return "qwen-6k"
+	}
+}
+
+func (s *AppServer) getBotInstance(ctx context.Context, tag string) (*modal.ClsInstance, error) {
+	tag = normalizeModel(tag)
+	s.instancesMu.RLock()
+	inst, ok := s.instances[tag]
+	s.instancesMu.RUnlock()
+	if ok {
+		return inst, nil
+	}
+
+	s.instancesMu.Lock()
+	defer s.instancesMu.Unlock()
+	if inst, ok := s.instances[tag]; ok {
+		return inst, nil
+	}
+
+	inst, err := s.modalCls.Instance(ctx, map[string]any{"model_tag": tag})
+	if err != nil {
+		return nil, err
+	}
+	s.instances[tag] = inst
+	return inst, nil
 }
 
 func (s *AppServer) handleChat(w http.ResponseWriter, r *http.Request, claims *Claims) {
@@ -410,10 +479,23 @@ func (s *AppServer) handleChat(w http.ResponseWriter, r *http.Request, claims *C
 		return
 	}
 
-	modelChoice := strings.ToLower(strings.TrimSpace(req.Model))
-	if modelChoice != "v1" && modelChoice != "v2" {
-		modelChoice = "v2"
+	// 0. Verify user and enforce prompt quota
+	user, err := GetUserByID(s.db, claims.UserID)
+	if err != nil || user == nil {
+		writeJSON(w, http.StatusUnauthorized, map[string]string{"error": "User account not found"})
+		return
 	}
+
+	if user.PromptLimit > 0 && user.PromptsUsed >= user.PromptLimit {
+		writeJSON(w, http.StatusForbidden, map[string]any{
+			"error":        fmt.Sprintf("You have reached your limit of %d messages. Please contact Aryan for more access.", user.PromptLimit),
+			"prompt_limit": user.PromptLimit,
+			"prompts_used": user.PromptsUsed,
+		})
+		return
+	}
+
+	modelChoice := normalizeModel(req.Model)
 
 	conversationID := strings.TrimSpace(req.ConversationID)
 	if conversationID == "" {
@@ -462,7 +544,23 @@ func (s *AppServer) handleChat(w http.ResponseWriter, r *http.Request, claims *C
 	ctx, cancel := context.WithTimeout(r.Context(), 120*time.Second)
 	defer cancel()
 
-	res, err := s.modalGenerate.Remote(ctx, []any{payload, modelChoice}, nil)
+	botInst, err := s.getBotInstance(ctx, modelChoice)
+	if err != nil {
+		log.Printf("Modal get instance error for %s: %v", modelChoice, err)
+		writeJSON(w, http.StatusBadGateway, map[string]string{"error": "Failed to connect to model backend."})
+		return
+	}
+
+	generateMethod, err := botInst.Method("generate")
+	if err != nil {
+		log.Printf("Modal get generate method error: %v", err)
+		writeJSON(w, http.StatusBadGateway, map[string]string{"error": "Failed to resolve inference method."})
+		return
+	}
+
+	res, err := generateMethod.Remote(ctx, []any{payload}, map[string]any{
+		"max_new_tokens": 256,
+	})
 	if err != nil {
 		log.Printf("Modal invocation error: %v", err)
 		writeJSON(w, http.StatusBadGateway, map[string]string{"error": "Model inference failed. Please try again."})
@@ -483,11 +581,17 @@ func (s *AppServer) handleChat(w http.ResponseWriter, r *http.Request, claims *C
 	_ = SaveConversationMessage(s.db, conversationID, claims.UserID, "user", fmt.Sprintf("Friend: %s", prompt), modelChoice)
 	_ = SaveConversationMessage(s.db, conversationID, claims.UserID, "assistant", reply, modelChoice)
 
+	// 5. Increment prompt usage counter for user
+	_ = IncrementPromptsUsed(s.db, claims.UserID)
+	promptsUsed := user.PromptsUsed + 1
+
 	writeJSON(w, http.StatusOK, ChatResponse{
 		Reply:          reply,
 		CreatedAt:      time.Now().UTC(),
 		ConversationID: conversationID,
 		Model:          modelChoice,
+		PromptsUsed:    promptsUsed,
+		PromptLimit:    user.PromptLimit,
 	})
 }
 
@@ -606,19 +710,33 @@ func (s *AppServer) handleWarmup(w http.ResponseWriter, r *http.Request, claims 
 	ctx, cancel := context.WithTimeout(r.Context(), 120*time.Second)
 	defer cancel()
 
-	var err error
-	if s.modalWarmup != nil {
-		_, err = s.modalWarmup.Remote(ctx, []any{}, nil)
+	modelChoice := normalizeModel(r.URL.Query().Get("model"))
+
+	botInst, err := s.getBotInstance(ctx, modelChoice)
+	if err != nil {
+		log.Printf("Warmup failed to get instance for %s: %v", modelChoice, err)
+		writeJSON(w, http.StatusBadGateway, map[string]string{"error": "Failed to warm up GPU container. Please try again."})
+		return
+	}
+
+	warmupMethod, err := botInst.Method("warmup")
+	if err == nil {
+		_, err = warmupMethod.Remote(ctx, []any{}, nil)
 	} else {
-		// Fallback to generate method if warmup method is not yet deployed on Modal
-		pingPayload := []any{
-			map[string]any{"role": "user", "content": "ping"},
+		// Fallback to pinging generate
+		generateMethod, genErr := botInst.Method("generate")
+		if genErr == nil {
+			pingPayload := []any{
+				map[string]any{"role": "user", "content": "ping"},
+			}
+			_, err = generateMethod.Remote(ctx, []any{pingPayload}, map[string]any{"max_new_tokens": 16})
+		} else {
+			err = genErr
 		}
-		_, err = s.modalGenerate.Remote(ctx, []any{pingPayload}, nil)
 	}
 
 	if err != nil {
-		log.Printf("Warmup failed: %v", err)
+		log.Printf("Warmup failed for %s: %v", modelChoice, err)
 		writeJSON(w, http.StatusBadGateway, map[string]string{"error": "Failed to warm up GPU container. Please try again."})
 		return
 	}

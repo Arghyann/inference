@@ -148,21 +148,30 @@ export interface ApiError {
 ---
 
 ### 4.3 Send Chat Message (Inference)
-Invokes the fine-tuned LLaMA model on Modal Cloud GPU. This is an asynchronous AI inference operation; requests typically take **1 to 5 seconds** depending on warm/cold container states.
+Invokes the fine-tuned model on Modal Cloud GPU. This is an AI inference operation; requests typically take **1 to 2 seconds** on warm containers (~20-25s on cold starts).
 - **URL:** `POST /api/chat`
 - **Auth:** Required (`Authorization: Bearer <TOKEN>`)
 - **Request Body:**
   ```json
   {
-    "message": "Hey Aryan, tell me about your projects."
+    "message": "Hey Aryan, tell me about your projects.",
+    "conversation_id": "conv_a1b2c3d4e5f6g7h8",
+    "model": "qwen-6k"
   }
   ```
+  *Supported `model` values:*
+  - `"qwen-6k"`: Qwen 2.5 14B — Balanced 6k persona *(Default)*
+  - `"qwen-comedy"`: Qwen 2.5 14B — Comedy & Banter Specialist
+  - `"llama-v3"`: LLaMA 3.1 8B — Balanced v3
+  - `"llama-v2"`: LLaMA 3 8B — Baseline v2
 - **Responses:**
   - `200 OK`:
     ```json
     {
-      "reply": "Hey! Lately I've been working on fine-tuning LLaMA models on custom conversational data and building inference pipelines.",
-      "created_at": "2026-09-18T20:01:30Z"
+      "reply": "Hey! Lately I've been working on fine-tuning models on custom conversational data.",
+      "created_at": "2026-09-18T20:01:30Z",
+      "conversation_id": "conv_a1b2c3d4e5f6g7h8",
+      "model": "qwen-6k"
     }
     ```
   - `400 Bad Request`: `{"error": "Message cannot be empty"}`
@@ -331,6 +340,23 @@ Permanently removes a conversation thread and its associated message history.
 
 ---
 
+### 4.11 Get User Profile & Quota
+Returns the authenticated user's profile and message quota information.
+- **URL:** `GET /api/user/me`
+- **Auth:** Required (`Authorization: Bearer <TOKEN>`)
+- **Responses:**
+  - `200 OK`:
+    ```json
+    {
+      "username": "johndoe",
+      "prompt_limit": 50,
+      "prompts_used": 12
+    }
+    ```
+  *Note: A `prompt_limit` of `0` or negative represents unlimited messages.*
+
+---
+
 ## 5. Ready-to-Use TypeScript API Client
 
 Save this as `src/lib/api.ts` in your frontend project (React, Next.js, Vue, or Svelte):
@@ -450,3 +476,26 @@ export const api = new ApiService();
    - Replace the typing indicator with the AI response once resolved.
 3. **Auto-Scrolling:** Keep the viewport anchored to the latest message as new replies arrive.
 4. **Input Handling:** Support `Enter` to submit and `Shift + Enter` for multi-line breaks.
+
+---
+
+## 7. SSH Server Administration & Quotas
+
+The inference backend binary includes administrative CLI commands that run locally over SSH:
+
+```bash
+# 1. Generate an invite code with default quota (50 messages)
+./server-bin -create-invite
+
+# 2. Generate an invite code with custom quota (e.g. 25 messages)
+./server-bin -create-invite -limit 25
+
+# 3. Generate an invite code with UNLIMITED messages
+./server-bin -create-invite -limit 0
+
+# 4. Update an existing user's message quota anytime
+./server-bin -set-limit -u johndoe -limit 100
+
+# 5. Directly create a user with a custom quota
+./server-bin -create-user -u johndoe -p mypassword -limit 50
+```

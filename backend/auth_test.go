@@ -136,3 +136,59 @@ func TestJWT_Lifecycle(t *testing.T) {
 		t.Fatal("Expected validation to fail with wrong secret")
 	}
 }
+
+func TestInviteCode_WithPromptLimit(t *testing.T) {
+	tempDir := t.TempDir()
+	dbPath := filepath.Join(tempDir, "test_limit_invite.db")
+
+	db, err := InitDB(dbPath)
+	if err != nil {
+		t.Fatalf("InitDB failed: %v", err)
+	}
+	defer db.Close()
+
+	// 1. Generate code with custom quota of 25 messages
+	code, err := GenerateInviteCode(db, 25)
+	if err != nil {
+		t.Fatalf("GenerateInviteCode failed: %v", err)
+	}
+
+	hash, _ := HashPassword("pass12345")
+	userID, err := RegisterUserWithInvite(db, "quotadude", hash, code)
+	if err != nil {
+		t.Fatalf("RegisterUserWithInvite failed: %v", err)
+	}
+
+	user, err := GetUserByID(db, userID)
+	if err != nil || user == nil {
+		t.Fatalf("Failed to get user by ID: %v", err)
+	}
+	if user.PromptLimit != 25 {
+		t.Fatalf("Expected prompt limit 25, got %d", user.PromptLimit)
+	}
+	if user.PromptsUsed != 0 {
+		t.Fatalf("Expected initial prompts used 0, got %d", user.PromptsUsed)
+	}
+
+	// 2. Increment prompts
+	err = IncrementPromptsUsed(db, userID)
+	if err != nil {
+		t.Fatalf("IncrementPromptsUsed failed: %v", err)
+	}
+
+	userAfter, _ := GetUserByID(db, userID)
+	if userAfter.PromptsUsed != 1 {
+		t.Fatalf("Expected prompts used 1, got %d", userAfter.PromptsUsed)
+	}
+
+	// 3. Admin updates limit
+	err = SetUserPromptLimit(db, "quotadude", 100)
+	if err != nil {
+		t.Fatalf("SetUserPromptLimit failed: %v", err)
+	}
+
+	userUpdated, _ := GetUserByID(db, userID)
+	if userUpdated.PromptLimit != 100 {
+		t.Fatalf("Expected prompt limit 100, got %d", userUpdated.PromptLimit)
+	}
+}

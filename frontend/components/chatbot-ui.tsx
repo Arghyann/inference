@@ -2,9 +2,63 @@
 
 import { FormEvent, KeyboardEvent, useEffect, useRef, useState } from "react"
 import { ArrowUp, ChevronDown, LogOut, MessageSquare, PanelLeft, Plus, Sparkles, Trash2, UserRound, X, Zap } from "lucide-react"
-import { api, ChatMessage, Conversation } from "@/lib/api"
+import { api, ChatMessage, Conversation, ModelTag } from "@/lib/api"
 
 type AuthMode = "login" | "register"
+
+export const MODEL_OPTIONS: {
+  id: ModelTag
+  label: string
+  short: string
+  badgeColor: string
+  description: string
+}[] = [
+  {
+    id: "qwen-6k",
+    label: "Qwen 2.5 14B — Balanced 6k",
+    short: "Qwen 14B",
+    badgeColor: "text-lime-400",
+    description: "Best all-around Aryan texting persona",
+  },
+  {
+    id: "qwen-comedy",
+    label: "Qwen 2.5 14B — Comedy & Banter",
+    short: "Comedy 14B",
+    badgeColor: "text-emerald-400",
+    description: "Punchy jokes, laugh reactions & sharp banter",
+  },
+  {
+    id: "llama-v3",
+    label: "Llama 3.1 8B — Balanced v3",
+    short: "Llama v3",
+    badgeColor: "text-cyan-400",
+    description: "Previous Llama 3.1 8B balanced model",
+  },
+  {
+    id: "llama-v2",
+    label: "Llama 3 8B — Baseline v2",
+    short: "Llama v2",
+    badgeColor: "text-amber-300",
+    description: "Initial 8B baseline fine-tune",
+  },
+]
+
+export function getModelBadge(modelTag?: string) {
+  switch (modelTag) {
+    case "qwen-comedy":
+      return { label: "Comedy 14B", color: "text-emerald-400" }
+    case "llama-v3":
+    case "v3":
+      return { label: "Llama v3", color: "text-cyan-400" }
+    case "llama-v2":
+    case "v2":
+    case "v1":
+      return { label: "Llama v2", color: "text-amber-300" }
+    case "qwen-6k":
+    default:
+      return { label: "Qwen 14B", color: "text-lime-400" }
+  }
+}
 
 export default function ChatbotUI() {
   const [authenticated, setAuthenticated] = useState(false)
@@ -24,7 +78,9 @@ export default function ChatbotUI() {
   const [authLoading, setAuthLoading] = useState(false)
   const [gpuWarm, setGpuWarm] = useState<boolean | null>(null)
   const [isWarmingUp, setIsWarmingUp] = useState(false)
-  const [selectedModel, setSelectedModel] = useState<"v1" | "v2">("v2")
+  const [selectedModel, setSelectedModel] = useState<ModelTag>("qwen-6k")
+  const [promptLimit, setPromptLimit] = useState<number | null>(null)
+  const [promptsUsed, setPromptsUsed] = useState<number>(0)
   const messagesEndRef = useRef<HTMLDivElement>(null)
 
   useEffect(() => {
@@ -34,6 +90,8 @@ export default function ChatbotUI() {
       setActiveConversationId(null)
       setMessages([])
       setUsername("")
+      setPromptLimit(null)
+      setPromptsUsed(0)
     }
     if (api.isAuthenticated()) {
       setAuthenticated(true)
@@ -49,6 +107,14 @@ export default function ChatbotUI() {
 
   useEffect(() => {
     if (!authenticated) return
+
+    // 0. Fetch user profile and message quota
+    api.getUserMe()
+      .then((me) => {
+        setPromptLimit(me.prompt_limit)
+        setPromptsUsed(me.prompts_used)
+      })
+      .catch(() => {})
 
     // 1. Fetch user conversations
     setIsConversationsLoading(true)
@@ -112,7 +178,7 @@ export default function ChatbotUI() {
     if (isWarmingUp) return
     setIsWarmingUp(true)
     try {
-      await api.warmup()
+      await api.warmup(selectedModel)
       setGpuWarm(true)
     } catch (error) {
       console.error("GPU warmup failed:", error)
@@ -195,6 +261,8 @@ export default function ChatbotUI() {
       } else {
         const result = await api.login({ username: name, password })
         setUsername(result.username)
+        if (result.prompt_limit !== undefined) setPromptLimit(result.prompt_limit)
+        if (result.prompts_used !== undefined) setPromptsUsed(result.prompts_used)
         setAuthenticated(true)
       }
     } catch (error) {
@@ -223,6 +291,9 @@ export default function ChatbotUI() {
         },
       ])
       setGpuWarm(true)
+
+      if (response.prompts_used !== undefined) setPromptsUsed(response.prompts_used)
+      if (response.prompt_limit !== undefined) setPromptLimit(response.prompt_limit)
 
       // If we were on a brand new chat, set active ID and refresh conversation list
       if (!activeConversationId && response.conversation_id) {
@@ -374,8 +445,16 @@ export default function ChatbotUI() {
             )}
           </div>
 
-          {/* Sidebar Footer: User profile + Logout */}
-          <div className="p-3 border-t border-white/10 mt-auto">
+          {/* Sidebar Footer: User profile + Quota + Logout */}
+          <div className="p-3 border-t border-white/10 mt-auto space-y-2">
+            {promptLimit !== null && (
+              <div className="flex items-center justify-between px-1 text-[11px] font-mono">
+                <span className="text-white/40">Message Quota:</span>
+                <span className={promptLimit > 0 && promptsUsed >= promptLimit ? "text-red-400 font-semibold" : "text-lime-300 font-medium"}>
+                  {promptLimit <= 0 ? "Unlimited" : `${Math.max(0, promptLimit - promptsUsed)} / ${promptLimit} left`}
+                </span>
+              </div>
+            )}
             <button
               type="button"
               onClick={() => api.logout()}
@@ -421,16 +500,34 @@ export default function ChatbotUI() {
             </div>
 
             <div className="flex items-center gap-2 shrink-0">
+              {/* Message Quota Pill */}
+              {promptLimit !== null && (
+                <div
+                  className={`hidden sm:flex items-center gap-1.5 rounded-full border px-2.5 py-1 text-xs font-mono ${
+                    promptLimit > 0 && promptsUsed >= promptLimit
+                      ? "border-red-400/30 bg-red-400/10 text-red-300"
+                      : "border-white/10 bg-white/[0.04] text-white/70"
+                  }`}
+                  title={promptLimit <= 0 ? "Unlimited message quota" : `${promptsUsed} of ${promptLimit} messages used`}
+                >
+                  <span className="text-[10px]">💬</span>
+                  <span>{promptLimit <= 0 ? "Unlimited" : `${Math.max(0, promptLimit - promptsUsed)} left`}</span>
+                </div>
+              )}
+
               {/* Model Dropdown */}
               <div className="relative">
                 <select
                   value={selectedModel}
-                  onChange={(e) => setSelectedModel(e.target.value as "v1" | "v2")}
+                  onChange={(e) => setSelectedModel(e.target.value as ModelTag)}
                   aria-label="Select AI Model Version"
                   className="h-8 appearance-none rounded-full border border-white/15 bg-white/[0.06] pl-3 pr-7 text-xs font-medium text-white transition hover:bg-white/[0.1] focus:border-lime-400/60 focus:outline-none cursor-pointer"
                 >
-                  <option value="v2" className="bg-[#121513] text-white">Aryan v2 (Natural)</option>
-                  <option value="v1" className="bg-[#121513] text-white">Aryan v1 (Legacy)</option>
+                  {MODEL_OPTIONS.map((opt) => (
+                    <option key={opt.id} value={opt.id} className="bg-[#121513] text-white">
+                      {opt.label}
+                    </option>
+                  ))}
                 </select>
                 <ChevronDown className="pointer-events-none absolute right-2.5 top-1/2 -translate-y-1/2 size-3 text-white/50" />
               </div>
@@ -475,30 +572,33 @@ export default function ChatbotUI() {
                 </div>
                 <h2 className="text-2xl font-semibold">What can I help with?</h2>
                 <p className="mt-2 text-sm text-white/45">
-                  Ask Aryan AI anything. Currently active:{" "}
-                  <span className={selectedModel === "v1" ? "text-amber-300 font-medium" : "text-lime-400 font-medium"}>
-                    {selectedModel === "v1" ? "Aryan v1 (Legacy)" : "Aryan v2 (Natural)"}
+                  Ask Aryan AI anything. Active persona:{" "}
+                  <span className={`${MODEL_OPTIONS.find((m) => m.id === selectedModel)?.badgeColor || "text-lime-400"} font-medium`}>
+                    {MODEL_OPTIONS.find((m) => m.id === selectedModel)?.label || selectedModel}
                   </span>
                 </p>
               </div>
             ) : (
               <div className="mx-auto max-w-2xl space-y-6">
-                {messages.map((message, index) => (
-                  <div key={`${message.created_at}-${index}`} className={`flex gap-3 ${message.role === "user" ? "justify-end" : "justify-start"}`}>
-                    <div className={`max-w-[85%] rounded-2xl px-4 py-3 text-sm leading-6 ${message.role === "user" ? "bg-lime-400 text-black" : "border border-white/10 bg-white/[0.06] text-white/85"}`}>
-                      {message.role === "assistant" && (
-                        <div className="mb-1 flex items-center gap-1.5 text-[10px] font-mono uppercase tracking-wider text-white/40">
-                          <span>Aryan AI</span>
-                          <span>•</span>
-                          <span className={message.model === "v1" ? "text-amber-300 font-semibold" : "text-lime-400 font-semibold"}>
-                            {message.model === "v1" ? "v1" : "v2"}
-                          </span>
-                        </div>
-                      )}
-                      <p className="whitespace-pre-wrap">{message.content}</p>
+                {messages.map((message, index) => {
+                  const badge = getModelBadge(message.model)
+                  return (
+                    <div key={`${message.created_at}-${index}`} className={`flex gap-3 ${message.role === "user" ? "justify-end" : "justify-start"}`}>
+                      <div className={`max-w-[85%] rounded-2xl px-4 py-3 text-sm leading-6 ${message.role === "user" ? "bg-lime-400 text-black" : "border border-white/10 bg-white/[0.06] text-white/85"}`}>
+                        {message.role === "assistant" && (
+                          <div className="mb-1 flex items-center gap-1.5 text-[10px] font-mono uppercase tracking-wider text-white/40">
+                            <span>Aryan AI</span>
+                            <span>•</span>
+                            <span className={`${badge.color} font-semibold`}>
+                              {badge.label}
+                            </span>
+                          </div>
+                        )}
+                        <p className="whitespace-pre-wrap">{message.content}</p>
+                      </div>
                     </div>
-                  </div>
-                ))}
+                  )
+                })}
                 {isLoading && (
                   <div className="flex items-center gap-2 text-sm text-white/45">
                     <span className="size-2 animate-pulse rounded-full bg-lime-300" />
@@ -518,8 +618,14 @@ export default function ChatbotUI() {
 
           {/* Chat Input Form */}
           <form onSubmit={sendMessage} className="mx-4 mb-4 rounded-2xl border border-white/10 bg-black/30 p-2 sm:mx-auto sm:mb-6 sm:w-[calc(100%-6rem)]">
+            {promptLimit !== null && promptLimit > 0 && promptsUsed >= promptLimit && (
+              <div className="mb-2 rounded-xl border border-red-400/30 bg-red-400/10 px-3 py-2 text-xs text-red-200">
+                You have reached your limit of {promptLimit} messages. Please contact Aryan to top up your quota.
+              </div>
+            )}
             <textarea
               value={input}
+              disabled={isLoading || (promptLimit !== null && promptLimit > 0 && promptsUsed >= promptLimit)}
               onChange={(event) => setInput(event.target.value)}
               onFocus={() => {
                 if (gpuWarm === false && !isWarmingUp) {
@@ -528,13 +634,26 @@ export default function ChatbotUI() {
               }}
               onKeyDown={handleKeyDown}
               rows={2}
-              placeholder="Message Aryan AI… (⌘K for New Chat)"
-              className="w-full resize-none bg-transparent px-3 py-2 text-sm outline-none placeholder:text-white/30"
+              placeholder={
+                promptLimit !== null && promptLimit > 0 && promptsUsed >= promptLimit
+                  ? "Message quota reached. Contact Aryan for more access."
+                  : "Message Aryan AI… (⌘K for New Chat)"
+              }
+              className="w-full resize-none bg-transparent px-3 py-2 text-sm outline-none placeholder:text-white/30 disabled:opacity-50 disabled:cursor-not-allowed"
             />
             <div className="flex items-center justify-between px-2 pb-1">
-              <span className="hidden text-xs text-white/30 sm:inline">Enter to send · Shift + Enter for newline</span>
+              <span className="hidden text-xs text-white/30 sm:inline">
+                {promptLimit !== null && promptLimit > 0 && promptsUsed >= promptLimit
+                  ? "Quota reached"
+                  : "Enter to send · Shift + Enter for newline"}
+              </span>
               <div className="ml-auto">
-                <button type="submit" disabled={!input.trim() || isLoading} aria-label="Send message" className="grid size-9 place-items-center rounded-xl bg-lime-400 text-black transition hover:bg-lime-300 disabled:bg-white/10 disabled:text-white/25">
+                <button
+                  type="submit"
+                  disabled={!input.trim() || isLoading || (promptLimit !== null && promptLimit > 0 && promptsUsed >= promptLimit)}
+                  aria-label="Send message"
+                  className="grid size-9 place-items-center rounded-xl bg-lime-400 text-black transition hover:bg-lime-300 disabled:bg-white/10 disabled:text-white/25"
+                >
                   <ArrowUp size={18} />
                 </button>
               </div>
