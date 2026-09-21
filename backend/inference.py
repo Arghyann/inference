@@ -34,40 +34,41 @@ SYSTEM_PROMPT = (
     max_containers=1,             # Cap at 1 GPU shared across backend clients
 )
 class ChatModel:
-    model_tag: str = modal.parameter(default="qwen-6k")
+    model_tag: str = modal.parameter(default="qwen")
 
     @modal.enter()
     def load_model(self):
         from unsloth import FastLanguageModel
 
-        MODEL_PATHS = {
-            "qwen-6k": "/data/aryan-qwen14b-6k-lora",
-            "qwen-comedy": "/data/aryan-qwen14b-comedy-lora",
-            "llama-v3": "/data/aryan-llama-lora-v3",
-            "llama-v2": "/data/aryan-llama-lora-v2",
-        }
+        # Normalize family: "qwen" or "llama"
+        family = "qwen" if "qwen" in (self.model_tag or "").lower() else "llama"
 
-        # Normalize tag and handle legacy aliases
-        tag = (self.model_tag or "qwen-6k").lower().strip()
-        if tag in ["v3", "llama-3"]:
-            tag = "llama-v3"
-        elif tag in ["v2", "v1", "llama-2"]:
-            tag = "llama-v2"
-        elif tag not in MODEL_PATHS:
-            tag = "qwen-6k"
-
-        checkpoint_path = MODEL_PATHS[tag]
-        print(f"Loading model '{tag}' from {checkpoint_path}...")
+        if family == "qwen":
+            checkpoint_base = "/data/aryan-qwen14b-6k-lora"
+            checkpoint_aux = "/data/aryan-qwen14b-comedy-lora"
+            aux_name = "comedy"
+            print(f"Loading Qwen 2.5 14B base + 6k adapter from {checkpoint_base}...")
+        else:
+            checkpoint_base = "/data/aryan-llama-lora-v3"
+            checkpoint_aux = "/data/aryan-llama-lora-v2"
+            aux_name = "v2"
+            print(f"Loading LLaMA 8B base + v3 adapter from {checkpoint_base}...")
 
         self.model, self.tokenizer = FastLanguageModel.from_pretrained(
-            model_name=checkpoint_path,
+            model_name=checkpoint_base,
             max_seq_length=2048,
             dtype=None,
             load_in_4bit=True,
         )
 
+        try:
+            print(f"Loading auxiliary adapter '{aux_name}' from {checkpoint_aux}...")
+            self.model.load_adapter(checkpoint_aux, adapter_name=aux_name)
+        except Exception as e:
+            print(f"Notice loading auxiliary adapter: {e}")
+
         FastLanguageModel.for_inference(self.model)
-        print(f"Model '{tag}' loaded into GPU VRAM and ready!")
+        print(f"Model family '{family}' loaded into GPU VRAM with dual adapters ready!")
 
     @modal.method()
     def warmup(self) -> str:
@@ -85,9 +86,25 @@ class ChatModel:
     ) -> str:
         import torch
 
-        # Default comedy temperature to 0.8 if standard 0.7 was passed
-        if self.model_tag == "qwen-comedy" and temperature == 0.7:
-            temperature = 0.8
+        # Instant (<1ms) adapter switch on the same warm GPU
+        req_model = (model or self.model_tag or "").lower()
+        if "comedy" in req_model or "funny" in req_model:
+            try:
+                self.model.set_adapter("comedy")
+            except Exception:
+                self.model.set_adapter("default")
+            if temperature == 0.7:
+                temperature = 0.8
+        elif "v2" in req_model or "v1" in req_model:
+            try:
+                self.model.set_adapter("v2")
+            except Exception:
+                self.model.set_adapter("default")
+        else:
+            try:
+                self.model.set_adapter("default")
+            except Exception:
+                pass
 
         # Inject system prompt at the beginning of conversational history
         messages = [{"role": "system", "content": SYSTEM_PROMPT}] + history

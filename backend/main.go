@@ -434,15 +434,27 @@ func normalizeModel(tag string) string {
 		return "llama-v3"
 	case "v2", "v1", "llama-2", "llama2", "llama":
 		return "llama-v2"
+	case "comedy", "funny", "qwen-funny":
+		return "qwen-comedy"
+	case "6k", "qwen":
+		return "qwen-6k"
 	default:
 		return "qwen-6k"
 	}
 }
 
+func getModelFamily(tag string) string {
+	clean := normalizeModel(tag)
+	if strings.HasPrefix(clean, "llama") {
+		return "llama"
+	}
+	return "qwen"
+}
+
 func (s *AppServer) getBotInstance(ctx context.Context, tag string) (*modal.ClsInstance, error) {
-	tag = normalizeModel(tag)
+	family := getModelFamily(tag)
 	s.instancesMu.RLock()
-	inst, ok := s.instances[tag]
+	inst, ok := s.instances[family]
 	s.instancesMu.RUnlock()
 	if ok {
 		return inst, nil
@@ -450,15 +462,15 @@ func (s *AppServer) getBotInstance(ctx context.Context, tag string) (*modal.ClsI
 
 	s.instancesMu.Lock()
 	defer s.instancesMu.Unlock()
-	if inst, ok := s.instances[tag]; ok {
+	if inst, ok := s.instances[family]; ok {
 		return inst, nil
 	}
 
-	inst, err := s.modalCls.Instance(ctx, map[string]any{"model_tag": tag})
+	inst, err := s.modalCls.Instance(ctx, map[string]any{"model_tag": family})
 	if err != nil {
 		return nil, err
 	}
-	s.instances[tag] = inst
+	s.instances[family] = inst
 	return inst, nil
 }
 
@@ -559,6 +571,7 @@ func (s *AppServer) handleChat(w http.ResponseWriter, r *http.Request, claims *C
 	}
 
 	res, err := generateMethod.Remote(ctx, []any{payload}, map[string]any{
+		"model":          modelChoice,
 		"max_new_tokens": 256,
 	})
 	if err != nil {

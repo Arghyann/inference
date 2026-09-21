@@ -74,13 +74,17 @@ def main():
         print("Deploying it first with: modal deploy backend/inference.py\n")
         return
 
-    # Cache bot references per tag so we don't recreate them
+    def get_family(tag):
+        return "qwen" if "qwen" in (tag or "").lower() else "llama"
+
+    # Cache bot references per architecture family so we reuse warm GPU containers
     bots = {}
     
     def get_bot(tag):
-        if tag not in bots:
-            bots[tag] = ChatModel(model_tag=tag)
-        return bots[tag]
+        family = get_family(tag)
+        if family not in bots:
+            bots[family] = ChatModel(model_tag=family)
+        return bots[family]
 
     bot = get_bot(current_tag)
 
@@ -189,6 +193,7 @@ def main():
         try:
             response = bot.generate.remote(
                 history=history,
+                model=current_tag,
                 temperature=current_temp,
                 top_p=0.9,
                 max_new_tokens=256,
